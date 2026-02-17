@@ -15,7 +15,7 @@ public static class ServiceCollectionExtensions
     /// Consuming projects must also:
     /// 1. Register IRetryDbContext (implement on your DbContext)
     /// 2. Apply RetryableOperationConfiguration in your DbContext
-    /// 3. Register IRetryOperationHandler implementations
+    /// 3. Register handlers via <see cref="AddRetryHandler{THandler}"/>
     /// 
     /// To use a custom storage backend (e.g. Redis), register your
     /// own IRetryStore implementation AFTER calling this method —
@@ -29,6 +29,8 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         TimeSpan? processingInterval = null)
     {
+        services.AddSingleton<RetryHandlerRegistry>();
+
         // Default store (EF Core) — consumers can override with their own IRetryStore
         services.AddScoped<IRetryStore, EfCoreRetryStore>();
 
@@ -42,6 +44,34 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<IHostedService>(sp =>
             sp.GetRequiredService<RetryProcessorService>());
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers an <see cref="IRetryOperationHandler"/> implementation.
+    /// Captures the static OperationName at registration time.
+    /// </summary>
+    public static IServiceCollection AddRetryHandler<THandler>(this IServiceCollection services)
+        where THandler : class, IRetryOperationHandler
+    {
+        services.AddScoped<THandler>();
+
+        // Build or retrieve the registry and register this handler's operation name
+        var registry = services
+            .Where(d => d.ServiceType == typeof(RetryHandlerRegistry))
+            .Select(d => d.ImplementationInstance)
+            .OfType<RetryHandlerRegistry>()
+            .FirstOrDefault();
+
+        if (registry == null)
+        {
+            registry = new RetryHandlerRegistry();
+            // Replace any existing registration
+            services.AddSingleton(registry);
+        }
+
+        registry.Register(THandler.OperationName, typeof(THandler));
 
         return services;
     }

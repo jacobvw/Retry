@@ -9,7 +9,7 @@ namespace JacobVW.Retry.Tests;
 /// </summary>
 public class TestRetryHandler : IRetryOperationHandler
 {
-    public string OperationName => "TestOperation";
+    public static string OperationName => "TestOperation";
     public int HandleCallCount { get; private set; }
     public bool ShouldThrow { get; set; }
     public string ThrowMessage { get; set; } = "Handler failed";

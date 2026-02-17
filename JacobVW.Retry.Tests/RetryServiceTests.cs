@@ -27,7 +27,13 @@ public class RetryServiceTests : IDisposable
             options.UseInMemoryDatabase(dbName));
         services.AddScoped<IRetryDbContext>(sp => sp.GetRequiredService<TestDbContext>());
         services.AddScoped<IRetryStore, EfCoreRetryStore>();
-        services.AddSingleton<IRetryOperationHandler>(_testHandler);
+
+        // Register handler via registry (mirrors AddRetryHandler<T> pattern)
+        var registry = new RetryHandlerRegistry();
+        registry.Register(TestRetryHandler.OperationName, typeof(TestRetryHandler));
+        services.AddSingleton(registry);
+        services.AddSingleton(_testHandler);
+
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug));
 
         _serviceProvider = services.BuildServiceProvider();

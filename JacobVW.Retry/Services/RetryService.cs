@@ -86,7 +86,7 @@ public class RetryService : IRetryService
     {
         await using var scope = _serviceProvider.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IRetryStore>();
-        var handlers = scope.ServiceProvider.GetRequiredService<IEnumerable<IRetryOperationHandler>>();
+        var registry = scope.ServiceProvider.GetRequiredService<RetryHandlerRegistry>();
 
         var now = DateTimeOffset.UtcNow;
 
@@ -140,8 +140,8 @@ public class RetryService : IRetryService
                 continue;
             }
 
-            var handler = handlers.FirstOrDefault(h => h.OperationName == operation.OperationName);
-            if (handler == null)
+            var handlerType = registry.GetHandlerType(operation.OperationName);
+            if (handlerType == null)
             {
                 _logger.LogError(
                     "No handler registered for operation '{OperationName}' (id={OperationId})",
@@ -153,6 +153,8 @@ public class RetryService : IRetryService
                 await store.UpdateAsync(operation, cancellationToken);
                 continue;
             }
+
+            var handler = (IRetryOperationHandler)scope.ServiceProvider.GetRequiredService(handlerType);
 
             operation.Status = RetryStatus.InProgress;
             operation.AttemptCount++;

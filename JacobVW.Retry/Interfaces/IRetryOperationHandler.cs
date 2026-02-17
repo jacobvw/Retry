@@ -11,8 +11,9 @@ public interface IRetryOperationHandler
     /// <summary>
     /// The operation name this handler processes.
     /// Must match <see cref="RetryableOperation.OperationName"/>.
+    /// Implement as: <c>public static string OperationName => "MyOperation";</c>
     /// </summary>
-    string OperationName { get; }
+    static abstract string OperationName { get; }
     
     /// <summary>
     /// Execute the operation. Throw on failure to trigger retry.
