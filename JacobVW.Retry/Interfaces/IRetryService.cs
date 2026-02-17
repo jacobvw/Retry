@@ -67,6 +67,16 @@ public interface IRetryService
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Get operations that were discarded on enqueue because a newer
+    /// or equal event already existed. Stored for auditing purposes.
+    /// </summary>
+    Task<List<RetryableOperation>> GetDiscardedAsync(
+        string? operationName = null,
+        int skip = 0,
+        int take = 50,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Get count of operations by status, optionally filtered by operation name.
     /// </summary>
     Task<Dictionary<RetryStatus, int>> GetStatusCountsAsync(

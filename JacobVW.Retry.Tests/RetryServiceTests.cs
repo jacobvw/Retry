@@ -109,13 +109,16 @@ public class RetryServiceTests : IDisposable
             eventTimestamp: olderTimestamp,
             serializedPayload: "{\"value\":1}");
 
-        // THEN it's skipped
+        // THEN it returns false (stale)
         Assert.False(result);
 
-        // AND only the newer operation exists
+        // AND both are stored — newer as Pending, older as Discarded
         var db = await GetDbContext();
-        var count = await db.RetryableOperations.CountAsync();
-        Assert.Equal(1, count);
+        var ops = await db.RetryableOperations.OrderBy(x => x.EventTimestamp).ToListAsync();
+        Assert.Equal(2, ops.Count);
+        Assert.Equal(RetryStatus.Discarded, ops[0].Status);
+        Assert.Equal(RetryStatus.Pending, ops[1].Status);
+        Assert.Contains("Discarded", ops[0].LastError);
     }
 
     [Fact]
@@ -890,5 +893,106 @@ public class RetryServiceTests : IDisposable
         var op = await db.RetryableOperations.SingleAsync();
         Assert.Equal(RetryStatus.Completed, op.Status);
         Assert.Equal(1, op.AttemptCount); // reset from 3 to 0, then incremented to 1
+    }
+
+    // ──────────────────────────────────────────
+    // DISCARDED EVENT TESTS
+    // ──────────────────────────────────────────
+
+    [Fact]
+    public async Task GetDiscardedAsync_ReturnsDiscardedOperations()
+    {
+        // GIVEN a newer event followed by a stale one (which gets discarded)
+        var newerTimestamp = DateTimeOffset.UtcNow;
+        var olderTimestamp = newerTimestamp.AddMinutes(-10);
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: newerTimestamp,
+            serializedPayload: null);
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: olderTimestamp,
+            serializedPayload: null);
+
+        // WHEN we query discarded
+        var discarded = await _retryService.GetDiscardedAsync();
+
+        // THEN only the stale one is returned
+        Assert.Single(discarded);
+        Assert.Equal(RetryStatus.Discarded, discarded[0].Status);
+        Assert.Equal(olderTimestamp, discarded[0].EventTimestamp);
+    }
+
+    [Fact]
+    public async Task GetDiscardedAsync_FiltersByOperationName()
+    {
+        // GIVEN discarded events of different types
+        await _retryService.EnqueueAsync("StockUpdate", "e1", DateTimeOffset.UtcNow, null);
+        await _retryService.EnqueueAsync("StockUpdate", "e1", DateTimeOffset.UtcNow.AddMinutes(-5), null);
+
+        await _retryService.EnqueueAsync("PriceSync", "e2", DateTimeOffset.UtcNow, null);
+        await _retryService.EnqueueAsync("PriceSync", "e2", DateTimeOffset.UtcNow.AddMinutes(-5), null);
+
+        // WHEN filtering
+        var discarded = await _retryService.GetDiscardedAsync(operationName: "StockUpdate");
+
+        // THEN only StockUpdate discarded returned
+        Assert.Single(discarded);
+        Assert.Equal("StockUpdate", discarded[0].OperationName);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_DiscardedEvent_PreservesPayload()
+    {
+        // GIVEN a newer event
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: "{\"newer\":true}");
+
+        // WHEN we enqueue a stale event with payload
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow.AddMinutes(-10),
+            serializedPayload: "{\"stale\":true}");
+
+        // THEN the discarded record preserves the payload for auditing
+        var discarded = await _retryService.GetDiscardedAsync();
+        Assert.Single(discarded);
+        Assert.Equal("{\"stale\":true}", discarded[0].SerializedPayload);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_DiscardedEvent_NotProcessed()
+    {
+        // GIVEN a newer event and a discarded stale one
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null);
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow.AddMinutes(-10),
+            serializedPayload: null);
+
+        // WHEN we process pending
+        await _retryService.ProcessPendingAsync();
+
+        // THEN handler was called once (only the Pending one, not Discarded)
+        Assert.Equal(1, _testHandler.HandleCallCount);
+
+        // AND the discarded one is still Discarded
+        var discarded = await _retryService.GetDiscardedAsync();
+        Assert.Single(discarded);
+        Assert.Equal(RetryStatus.Discarded, discarded[0].Status);
     }
 }

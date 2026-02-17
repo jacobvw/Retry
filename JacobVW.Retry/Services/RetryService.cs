@@ -39,8 +39,21 @@ public class RetryService : IRetryService
 
         if (existingNewer)
         {
+            // Store the stale event as Discarded for auditing
+            var discardedOp = new RetryableOperation
+            {
+                OperationName = operationName,
+                EntityKey = entityKey,
+                EventTimestamp = eventTimestamp,
+                SerializedPayload = serializedPayload,
+                MaxRetries = maxRetries,
+                Status = RetryStatus.Discarded,
+                LastError = $"Discarded: a newer or equal event already exists for {operationName}/{entityKey}"
+            };
+            await store.AddAsync(discardedOp, cancellationToken);
+
             _logger.LogDebug(
-                "Skipping stale {OperationName} for {EntityKey}: event={EventTimestamp}, a newer or equal event already exists",
+                "Discarded stale {OperationName} for {EntityKey}: event={EventTimestamp}, a newer or equal event already exists",
                 operationName, entityKey, eventTimestamp);
             return false;
         }
@@ -217,6 +230,17 @@ public class RetryService : IRetryService
         await using var scope = _serviceProvider.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IRetryStore>();
         return await store.GetByStatusAsync(RetryStatus.Superseded, operationName, skip, take, cancellationToken);
+    }
+
+    public async Task<List<RetryableOperation>> GetDiscardedAsync(
+        string? operationName = null,
+        int skip = 0,
+        int take = 50,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var store = scope.ServiceProvider.GetRequiredService<IRetryStore>();
+        return await store.GetByStatusAsync(RetryStatus.Discarded, operationName, skip, take, cancellationToken);
     }
 
     public async Task<Dictionary<RetryStatus, int>> GetStatusCountsAsync(
