@@ -12,10 +12,14 @@
         <Authors>JacobVW</Authors>
         <Description>DB-backed retry service with timestamp-aware idempotency for .NET applications</Description>
         <PackageTags>retry;resilience;ef-core;idempotency</PackageTags>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <RepositoryUrl>https://github.com/jacobvw/JacobVW.Retry</RepositoryUrl>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     </PropertyGroup>
 
     <ItemGroup>
+        <None Include="../README.md" Pack="true" PackagePath="/" />
         <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.1" />
         <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.1" />
         <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.1" />
