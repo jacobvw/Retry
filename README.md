@@ -5,12 +5,12 @@ DB-backed retry service with timestamp-aware idempotency for .NET applications.
 ## Features
 
 - **Pluggable storage backend** — ships with EF Core, implement `IRetryStore` for Redis/MongoDB/etc.
-- **Timestamp-aware deduplication** — out-of-order events are automatically discarded
+- **Timestamp-aware deduplication** — out-of-order events are stored as `Discarded` for auditing
 - **Expiry mechanism** — operations stop retrying after a configurable deadline
 - **Supersede detection** — older events are marked `Superseded` when newer ones complete
 - **Exponential backoff with jitter** — prevents thundering herd on retries
 - **Pluggable handlers** — implement `IRetryOperationHandler` for each operation type
-- **Query API** — check failed, expired, and superseded operations; get status counts
+- **Query API** — check failed, expired, superseded, and discarded operations; get status counts
 - **Re-enqueue expired** — retry expired operations with a new deadline
 
 ## Installation
@@ -96,6 +96,9 @@ var expired = await retryService.GetExpiredAsync();
 // Get superseded operations (skipped — newer event already completed)
 var superseded = await retryService.GetSupersededAsync();
 
+// Get discarded operations (stale events stored for auditing)
+var discarded = await retryService.GetDiscardedAsync();
+
 // Get counts by status
 var counts = await retryService.GetStatusCountsAsync();
 // counts[RetryStatus.Pending], counts[RetryStatus.Failed], etc.
@@ -125,7 +128,10 @@ await retryService.RetryExpiredAsync(
 | `Completed` | Successfully processed |
 | `Failed` | Handler threw — will retry if attempts remain |
 | `Expired` | Past `ExpiresAt` deadline, stopped retrying |
-| `Superseded` | Skipped — a newer event for the same entity already completed |
+| `Superseded` | A newer event for the same entity completed during processing |
+| `Discarded` | Stale event — a newer or equal event already existed at enqueue time |
+
+> **Superseded vs Discarded:** `Discarded` events are caught at enqueue time (never processed). `Superseded` events were queued first but a newer event completed before they were processed.
 
 ## Custom Storage Backend
 
