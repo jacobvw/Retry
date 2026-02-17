@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <RootNamespace>JacobVW.Retry</RootNamespace>
+
+        <!-- NuGet packaging -->
+        <PackageId>JacobVW.Retry</PackageId>
+        <Version>10.0.0</Version>
+        <Authors>JacobVW</Authors>
+        <Description>DB-backed retry service with timestamp-aware idempotency for .NET applications</Description>
+        <PackageTags>retry;resilience;ef-core;idempotency</PackageTags>
+        <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.1" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.1" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.1" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.1" />
+    </ItemGroup>
+
+</Project>
