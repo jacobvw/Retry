@@ -1,14 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
-        <TargetFramework>net10.0</TargetFramework>
+        <TargetFrameworks>net9.0;net10.0</TargetFrameworks>
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <RootNamespace>JacobVW.Retry</RootNamespace>
 
         <!-- NuGet packaging -->
         <PackageId>JacobVW.Retry</PackageId>
-        <Version>10.0.0</Version>
+        <Version>10.1.0</Version>
         <Authors>JacobVW</Authors>
         <Description>DB-backed retry service with timestamp-aware idempotency for .NET applications</Description>
         <PackageTags>retry;resilience;ef-core;idempotency</PackageTags>
@@ -20,6 +20,18 @@
 
     <ItemGroup>
         <None Include="../README.md" Pack="true" PackagePath="/" />
+    </ItemGroup>
+
+    <!-- net9.0 dependencies -->
+    <ItemGroup Condition="'$(TargetFramework)' == 'net9.0'">
+        <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="9.0.3" />
+        <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="9.0.3" />
+        <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="9.0.3" />
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="9.0.3" />
+    </ItemGroup>
+
+    <!-- net10.0 dependencies -->
+    <ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
         <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.1" />
         <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.1" />
         <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.1" />
