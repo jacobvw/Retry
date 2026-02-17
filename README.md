@@ -4,11 +4,14 @@ DB-backed retry service with timestamp-aware idempotency for .NET applications.
 
 ## Features
 
-- **DB-backed persistence** — survives app restarts, works across multiple instances
+- **Pluggable storage backend** — ships with EF Core, implement `IRetryStore` for Redis/MongoDB/etc.
 - **Timestamp-aware deduplication** — out-of-order events are automatically discarded
+- **Expiry mechanism** — operations stop retrying after a configurable deadline
+- **Supersede detection** — older events are marked `Superseded` when newer ones complete
 - **Exponential backoff with jitter** — prevents thundering herd on retries
 - **Pluggable handlers** — implement `IRetryOperationHandler` for each operation type
-- **One-liner setup** — `builder.Services.AddRetryService()`
+- **Query API** — check failed, expired, and superseded operations; get status counts
+- **Re-enqueue expired** — retry expired operations with a new deadline
 
 ## Installation
 
@@ -43,17 +46,22 @@ public class MyDbContext : DbContext, IRetryDbContext
 builder.Services.AddRetryService();
 ```
 
+This registers:
+- `IRetryStore` → `EfCoreRetryStore` (default storage backend)
+- `IRetryService` → `RetryService`
+- `RetryProcessorService` (background worker)
+
 ### 3. Create a handler
 
 ```csharp
-public class MyOperationHandler : IRetryOperationHandler
+public class StockUpdateHandler : IRetryOperationHandler
 {
-    public string OperationName => "MyOperation";
+    public string OperationName => "StockUpdate";
 
     public async Task HandleAsync(RetryableOperation operation, CancellationToken ct)
     {
-        var payload = JsonSerializer.Deserialize<MyPayload>(operation.SerializedPayload!);
-        // do work — throw on failure to trigger retry
+        var payload = JsonSerializer.Deserialize<StockPayload>(operation.SerializedPayload!);
+        // Do work — throw on failure to trigger retry
     }
 }
 ```
@@ -61,20 +69,74 @@ public class MyOperationHandler : IRetryOperationHandler
 ### 4. Register your handler
 
 ```csharp
-builder.Services.AddScoped<MyOperationHandler>();
-builder.Services.AddScoped<IRetryOperationHandler>(sp =>
-    sp.GetRequiredService<MyOperationHandler>());
+builder.Services.AddScoped<IRetryOperationHandler, StockUpdateHandler>();
 ```
 
 ### 5. Enqueue operations
 
 ```csharp
 await retryService.EnqueueAsync(
-    operationName: "MyOperation",
-    entityKey: "unique-entity-id",
+    operationName: "StockUpdate",
+    entityKey: "BMW:51357339591",
     eventTimestamp: DateTimeOffset.UtcNow,
-    serializedPayload: JsonSerializer.Serialize(payload));
+    serializedPayload: JsonSerializer.Serialize(payload),
+    maxRetries: 5,
+    maxFailedDuration: TimeSpan.FromHours(12));
 ```
+
+## Query API
+
+```csharp
+// Get permanently failed operations (exhausted all retries)
+var failed = await retryService.GetFailedAsync(operationName: "StockUpdate");
+
+// Get expired operations (past deadline)
+var expired = await retryService.GetExpiredAsync();
+
+// Get superseded operations (skipped — newer event already completed)
+var superseded = await retryService.GetSupersededAsync();
+
+// Get counts by status
+var counts = await retryService.GetStatusCountsAsync();
+// counts[RetryStatus.Pending], counts[RetryStatus.Failed], etc.
+```
+
+## Re-enqueue Expired Operations
+
+```csharp
+// Retry all expired operations with a new 24h deadline (default)
+int count = await retryService.RetryExpiredAsync();
+
+// Retry a single expired operation by ID
+await retryService.RetryExpiredAsync(operationId: someGuid);
+
+// Retry all expired of a specific type with a custom deadline
+await retryService.RetryExpiredAsync(
+    operationName: "StockUpdate",
+    newMaxFailedDuration: TimeSpan.FromHours(4));
+```
+
+## Operation Statuses
+
+| Status | Meaning |
+|---|---|
+| `Pending` | Waiting to be processed |
+| `InProgress` | Currently being handled |
+| `Completed` | Successfully processed |
+| `Failed` | Handler threw — will retry if attempts remain |
+| `Expired` | Past `ExpiresAt` deadline, stopped retrying |
+| `Superseded` | Skipped — a newer event for the same entity already completed |
+
+## Custom Storage Backend
+
+The default backend is EF Core via `EfCoreRetryStore`. To use a different backend (Redis, MongoDB, etc.), implement `IRetryStore` and register it after `AddRetryService()`:
+
+```csharp
+builder.Services.AddRetryService();
+builder.Services.AddScoped<IRetryStore, RedisRetryStore>(); // overrides default
+```
+
+`IRetryStore` has 11 methods — 8 queries and 3 mutations. Each mutation must persist immediately (no `SaveChanges` concept).
 
 ## Configuration
 

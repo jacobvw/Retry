@@ -48,6 +48,14 @@ public class RetryableOperation
     public DateTimeOffset? NextRetryAt { get; set; }
     
     public DateTimeOffset? CompletedAt { get; set; }
+    
+    /// <summary>
+    /// Absolute deadline after which this operation will not be
+    /// retried, regardless of remaining attempts. Set during
+    /// enqueue based on the configured max failed duration.
+    /// </summary>
+    public DateTimeOffset? ExpiresAt { get; set; }
+    
     public string? LastError { get; set; }
     public RetryStatus Status { get; set; } = RetryStatus.Pending;
     
@@ -83,6 +91,10 @@ public class RetryableOperationConfiguration : IEntityTypeConfiguration<Retryabl
         // Index for processing pending/failed operations
         builder.HasIndex(x => new { x.Status, x.NextRetryAt })
             .HasDatabaseName("IX_RetryableOperations_Status_NextRetryAt");
+        
+        // Index for expired operations query
+        builder.HasIndex(x => new { x.Status, x.ExpiresAt })
+            .HasDatabaseName("IX_RetryableOperations_Status_ExpiresAt");
         
         // Index for operation name routing
         builder.HasIndex(x => x.OperationName)

@@ -5,5 +5,8 @@ public enum RetryStatus
     Pending,
     InProgress,
     Completed,
-    Failed
+    Failed,
+    Expired,
+    Superseded,
+    Discarded
 }
