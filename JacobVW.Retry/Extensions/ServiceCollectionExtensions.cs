@@ -1,6 +1,7 @@
 using JacobVW.Retry.Interfaces;
 using JacobVW.Retry.Services;
 using JacobVW.Retry.Stores;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 
@@ -9,17 +10,39 @@ namespace JacobVW.Retry.Extensions;
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers JacobVW.Retry services: IRetryService, the default
-    /// EfCoreRetryStore, and the background RetryProcessorService.
+    /// Registers JacobVW.Retry with the default EF Core storage backend.
+    /// Automatically registers IRetryDbContext and IRetryStore for you.
     /// 
-    /// Consuming projects must also:
-    /// 1. Register IRetryDbContext (implement on your DbContext)
-    /// 2. Apply RetryableOperationConfiguration in your DbContext
+    /// Consuming projects must:
+    /// 1. Implement IRetryDbContext on their DbContext
+    /// 2. Apply RetryableOperationConfiguration in OnModelCreating
     /// 3. Register handlers via <see cref="AddRetryHandler{THandler}"/>
+    /// </summary>
+    /// <typeparam name="TDbContext">
+    /// Your DbContext that implements <see cref="IRetryDbContext"/>
+    /// </typeparam>
+    /// <param name="services">Service collection</param>
+    /// <param name="processingInterval">
+    /// How often to check for pending operations (default: 30 seconds)
+    /// </param>
+    public static IServiceCollection AddRetryService<TDbContext>(
+        this IServiceCollection services,
+        TimeSpan? processingInterval = null)
+        where TDbContext : DbContext, IRetryDbContext
+    {
+        // TODO: Split EF Core backend into a separate JacobVW.Retry.EntityFrameworkCore package
+        services.AddScoped<IRetryDbContext>(sp => sp.GetRequiredService<TDbContext>());
+        services.AddScoped<IRetryStore, EfCoreRetryStore>();
+
+        return services.AddRetryServiceCore(processingInterval);
+    }
+
+    /// <summary>
+    /// Registers JacobVW.Retry without a storage backend.
+    /// Use this when providing a custom <see cref="IRetryStore"/>
+    /// implementation (e.g. Redis, MongoDB).
     /// 
-    /// To use a custom storage backend (e.g. Redis), register your
-    /// own IRetryStore implementation AFTER calling this method —
-    /// it will override the default EfCoreRetryStore.
+    /// You must register your own IRetryStore after calling this method.
     /// </summary>
     /// <param name="services">Service collection</param>
     /// <param name="processingInterval">
@@ -29,23 +52,7 @@ public static class ServiceCollectionExtensions
         this IServiceCollection services,
         TimeSpan? processingInterval = null)
     {
-        services.AddSingleton<RetryHandlerRegistry>();
-
-        // Default store (EF Core) — consumers can override with their own IRetryStore
-        services.AddScoped<IRetryStore, EfCoreRetryStore>();
-
-        services.AddScoped<IRetryService, RetryService>();
-
-        services.AddSingleton<RetryProcessorService>(sp =>
-            new RetryProcessorService(
-                serviceProvider: sp,
-                logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RetryProcessorService>>(),
-                interval: processingInterval));
-
-        services.AddSingleton<IHostedService>(sp =>
-            sp.GetRequiredService<RetryProcessorService>());
-
-        return services;
+        return services.AddRetryServiceCore(processingInterval);
     }
 
     /// <summary>
@@ -67,11 +74,30 @@ public static class ServiceCollectionExtensions
         if (registry == null)
         {
             registry = new RetryHandlerRegistry();
-            // Replace any existing registration
             services.AddSingleton(registry);
         }
 
         registry.Register(THandler.OperationName, typeof(THandler));
+
+        return services;
+    }
+
+    private static IServiceCollection AddRetryServiceCore(
+        this IServiceCollection services,
+        TimeSpan? processingInterval)
+    {
+        services.AddSingleton<RetryHandlerRegistry>();
+
+        services.AddScoped<IRetryService, RetryService>();
+
+        services.AddSingleton<RetryProcessorService>(sp =>
+            new RetryProcessorService(
+                serviceProvider: sp,
+                logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RetryProcessorService>>(),
+                interval: processingInterval));
+
+        services.AddSingleton<IHostedService>(sp =>
+            sp.GetRequiredService<RetryProcessorService>());
 
         return services;
     }

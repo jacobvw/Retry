@@ -43,7 +43,7 @@ public class MyDbContext : DbContext, IRetryDbContext
 ### 2. Register services
 
 ```csharp
-builder.Services.AddRetryService();
+builder.Services.AddRetryService<MyDbContext>();
 ```
 
 This registers:
@@ -56,7 +56,7 @@ This registers:
 ```csharp
 public class StockUpdateHandler : IRetryOperationHandler
 {
-    public string OperationName => "StockUpdate";
+    public static string OperationName => "StockUpdate";
 
     public async Task HandleAsync(RetryableOperation operation, CancellationToken ct)
     {
@@ -69,7 +69,7 @@ public class StockUpdateHandler : IRetryOperationHandler
 ### 4. Register your handler
 
 ```csharp
-builder.Services.AddScoped<IRetryOperationHandler, StockUpdateHandler>();
+builder.Services.AddRetryHandler<StockUpdateHandler>();
 ```
 
 ### 5. Enqueue operations
@@ -135,11 +135,11 @@ await retryService.RetryExpiredAsync(
 
 ## Custom Storage Backend
 
-The default backend is EF Core via `EfCoreRetryStore`. To use a different backend (Redis, MongoDB, etc.), implement `IRetryStore` and register it after `AddRetryService()`:
+To use a different backend (Redis, MongoDB, etc.), implement `IRetryStore` and use the non-generic `AddRetryService()` overload:
 
 ```csharp
-builder.Services.AddRetryService();
-builder.Services.AddScoped<IRetryStore, RedisRetryStore>(); // overrides default
+builder.Services.AddRetryService(); // no EF Core store registered
+builder.Services.AddScoped<IRetryStore, RedisRetryStore>();
 ```
 
 `IRetryStore` has 11 methods — 8 queries and 3 mutations. Each mutation must persist immediately (no `SaveChanges` concept).
@@ -150,6 +150,11 @@ builder.Services.AddScoped<IRetryStore, RedisRetryStore>(); // overrides default
 // Custom processing interval (default: 30 seconds)
 builder.Services.AddRetryService(processingInterval: TimeSpan.FromSeconds(10));
 ```
+
+## Supported Frameworks
+
+- .NET 9.0
+- .NET 10.0
 
 ## License
 
