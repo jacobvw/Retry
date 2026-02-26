@@ -151,7 +151,8 @@ public class EfCoreRetryStore : IRetryStore
         CancellationToken cancellationToken = default)
     {
         var query = _dbContext.RetryableOperations
-            .Where(x => x.Status == RetryStatus.Expired);
+            .Where(x => x.Status == RetryStatus.Expired
+                        || (x.Status == RetryStatus.Failed && x.AttemptCount >= x.MaxRetries));
 
         if (operationId.HasValue)
         {

@@ -238,7 +238,7 @@ public class RetryServiceTests : IDisposable
         // WHEN we process
         await _retryService.ProcessPendingAsync();
 
-        // THEN it's marked failed with error message
+        // THEN it's marked failed with error message (will be retried)
         var db = await GetDbContext();
         var op = await db.RetryableOperations.SingleAsync();
         Assert.Equal(RetryStatus.Failed, op.Status);
@@ -838,7 +838,7 @@ public class RetryServiceTests : IDisposable
     [Fact]
     public async Task RetryExpiredAsync_DoesNotAffectNonExpiredStatuses()
     {
-        // GIVEN operations in various non-expired statuses
+        // GIVEN operations in various non-expired/non-exhausted statuses
         await SeedOperationsAsync(
             new RetryableOperation
             {
@@ -847,9 +847,10 @@ public class RetryServiceTests : IDisposable
             },
             new RetryableOperation
             {
-                OperationName = "TestOperation", EntityKey = "failed",
+                // Still has retries remaining — should NOT be affected
+                OperationName = "TestOperation", EntityKey = "failed-retrying",
                 EventTimestamp = DateTimeOffset.UtcNow,
-                Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 3
+                Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 1
             },
             new RetryableOperation
             {
@@ -865,13 +866,13 @@ public class RetryServiceTests : IDisposable
         // WHEN
         var count = await _retryService.RetryExpiredAsync();
 
-        // THEN none are affected
+        // THEN none are affected (Failed with retries remaining is not treated as terminal)
         Assert.Equal(0, count);
 
         var db = await GetDbContext();
         var ops = await db.RetryableOperations.ToListAsync();
         Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "pending").Status);
-        Assert.Equal(RetryStatus.Failed, ops.Single(x => x.EntityKey == "failed").Status);
+        Assert.Equal(RetryStatus.Failed, ops.Single(x => x.EntityKey == "failed-retrying").Status);
         Assert.Equal(RetryStatus.Completed, ops.Single(x => x.EntityKey == "completed").Status);
         Assert.Equal(RetryStatus.Superseded, ops.Single(x => x.EntityKey == "superseded").Status);
     }
