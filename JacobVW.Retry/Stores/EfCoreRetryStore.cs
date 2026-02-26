@@ -28,12 +28,19 @@ public class EfCoreRetryStore : IRetryStore
         DateTimeOffset eventTimestamp,
         CancellationToken cancellationToken = default)
     {
+        // Block re-enqueueing if there's already an active or completed record at the
+        // same-or-newer timestamp: Pending (mid-retry), InProgress (running), or Completed
+        // (already done — deduplicates webhook replays at the same timestamp).
+        // Expired, Superseded, Discarded, and permanently-Failed records do NOT block, so
+        // a genuine new incoming event for the same entity can still be processed.
         return await _dbContext.RetryableOperations
             .AnyAsync(
                 x => x.EntityKey == entityKey
                      && x.OperationName == operationName
                      && x.EventTimestamp >= eventTimestamp
-                     && x.Status != RetryStatus.Failed,
+                     && (x.Status == RetryStatus.Pending
+                         || x.Status == RetryStatus.InProgress
+                         || x.Status == RetryStatus.Completed),
                 cancellationToken);
     }
 
@@ -50,6 +57,15 @@ public class EfCoreRetryStore : IRetryStore
                      && x.EventTimestamp > eventTimestamp
                      && x.Status == RetryStatus.Completed,
                 cancellationToken);
+    }
+
+    public async Task<List<RetryableOperation>> GetStuckInProgressAsync(
+        DateTimeOffset cutoff,
+        CancellationToken cancellationToken = default)
+    {
+        return await _dbContext.RetryableOperations
+            .Where(x => x.Status == RetryStatus.InProgress && x.UpdatedAt <= cutoff)
+            .ToListAsync(cancellationToken);
     }
 
     public async Task<List<RetryableOperation>> GetOperationsPastDeadlineAsync(
@@ -70,10 +86,13 @@ public class EfCoreRetryStore : IRetryStore
         int batchSize = 100,
         CancellationToken cancellationToken = default)
     {
+        // Only Pending is the active-retry status now — Failed means permanently
+        // exhausted (AttemptCount >= MaxRetries) and should not be re-processed here.
+        // AttemptCount == 0 ensures MaxRetries = 0 still gets one attempt ("try once, no retries").
         return await _dbContext.RetryableOperations
-            .Where(x => (x.Status == RetryStatus.Pending || x.Status == RetryStatus.Failed)
+            .Where(x => x.Status == RetryStatus.Pending
                         && (x.NextRetryAt == null || x.NextRetryAt <= now)
-                        && x.AttemptCount < x.MaxRetries
+                        && (x.AttemptCount == 0 || x.AttemptCount < x.MaxRetries)
                         && (x.ExpiresAt == null || x.ExpiresAt > now))
             .OrderBy(x => x.NextRetryAt ?? x.CreatedAt)
             .Take(batchSize)

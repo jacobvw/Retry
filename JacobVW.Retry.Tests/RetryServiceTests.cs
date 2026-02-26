@@ -222,7 +222,7 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task ProcessPending_HandlerThrows_MarksFailedWithRetry()
+    public async Task ProcessPending_HandlerThrows_MarksPendingWithNextRetryAt()
     {
         // GIVEN an enqueued operation with max 3 retries
         _testHandler.ShouldThrow = true;
@@ -238,13 +238,14 @@ public class RetryServiceTests : IDisposable
         // WHEN we process
         await _retryService.ProcessPendingAsync();
 
-        // THEN it's marked failed with error message (will be retried)
+        // THEN it's marked Pending (not Failed) so it will be retried again
         var db = await GetDbContext();
         var op = await db.RetryableOperations.SingleAsync();
-        Assert.Equal(RetryStatus.Failed, op.Status);
+        Assert.Equal(RetryStatus.Pending, op.Status);
         Assert.Equal("Connection refused", op.LastError);
         Assert.Equal(1, op.AttemptCount);
-        Assert.NotNull(op.NextRetryAt); // scheduled for retry
+        Assert.NotNull(op.NextRetryAt); // scheduled for next retry
+        Assert.True(op.NextRetryAt > DateTimeOffset.UtcNow); // in the future
     }
 
     [Fact]
@@ -268,6 +269,34 @@ public class RetryServiceTests : IDisposable
         var op = await db.RetryableOperations.SingleAsync();
         Assert.Equal(RetryStatus.Failed, op.Status);
         Assert.Equal(1, op.AttemptCount);
+    }
+
+    [Fact]
+    public async Task ProcessPending_MaxRetriesZero_TriesOnceAndFails()
+    {
+        // GIVEN an operation with MaxRetries = 0 ("try once, no retries")
+        _testHandler.ShouldThrow = true;
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null,
+            maxRetries: 0);
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN it was attempted exactly once and is permanently failed
+        Assert.Equal(1, _testHandler.HandleCallCount);
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Failed, op.Status);
+        Assert.Equal(1, op.AttemptCount);
+
+        // AND a second process run does NOT pick it up again
+        await _retryService.ProcessPendingAsync();
+        Assert.Equal(1, _testHandler.HandleCallCount); // still 1
     }
 
     [Fact]
@@ -592,6 +621,64 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task EnqueueAsync_StaleEventAfterCompletion_IsBlocked()
+    {
+        // GIVEN a completed operation at T1
+        var completedTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: completedTimestamp,
+            serializedPayload: null);
+        await _retryService.ProcessPendingAsync();
+
+        // WHEN a stale event (older timestamp) arrives — e.g. a delayed webhook replay
+        var staleTimestamp = completedTimestamp.AddMinutes(-10);
+        var result = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: staleTimestamp,
+            serializedPayload: null);
+
+        // THEN it is blocked (completed record at newer-or-equal timestamp exists)
+        Assert.False(result);
+
+        // AND it's stored as Discarded, not re-processed
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        Assert.Equal(2, ops.Count);
+        Assert.Single(ops, x => x.Status == RetryStatus.Discarded);
+        Assert.Single(ops, x => x.Status == RetryStatus.Completed);
+        Assert.Equal(1, _testHandler.HandleCallCount); // only processed once
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_NewEventAfterPermanentFailure_IsAccepted()
+    {
+        // GIVEN a permanently failed operation (exhausted all retries)
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5),
+            Status = RetryStatus.Failed,
+            MaxRetries = 1,
+            AttemptCount = 1, // exhausted
+            LastError = "Permanent failure"
+        });
+
+        // WHEN a new event arrives at the same timestamp
+        var result = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow.AddMinutes(-5),
+            serializedPayload: null);
+
+        // THEN it IS accepted — permanently-failed records don't block new attempts
+        Assert.True(result);
+    }
+
+    [Fact]
     public async Task EnqueueAsync_DifferentOperationNames_IndependentTimestamps()
     {
         // GIVEN a StockUpdate event at time T
@@ -838,7 +925,7 @@ public class RetryServiceTests : IDisposable
     [Fact]
     public async Task RetryExpiredAsync_DoesNotAffectNonExpiredStatuses()
     {
-        // GIVEN operations in various non-expired/non-exhausted statuses
+        // GIVEN operations in various non-expired statuses
         await SeedOperationsAsync(
             new RetryableOperation
             {
@@ -847,10 +934,11 @@ public class RetryServiceTests : IDisposable
             },
             new RetryableOperation
             {
-                // Still has retries remaining — should NOT be affected
-                OperationName = "TestOperation", EntityKey = "failed-retrying",
+                // Mid-retry (pending, still has attempts remaining) — should NOT be affected
+                OperationName = "TestOperation", EntityKey = "pending-mid-retry",
                 EventTimestamp = DateTimeOffset.UtcNow,
-                Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 1
+                Status = RetryStatus.Pending, MaxRetries = 3, AttemptCount = 1,
+                NextRetryAt = DateTimeOffset.UtcNow.AddMinutes(5)
             },
             new RetryableOperation
             {
@@ -866,13 +954,13 @@ public class RetryServiceTests : IDisposable
         // WHEN
         var count = await _retryService.RetryExpiredAsync();
 
-        // THEN none are affected (Failed with retries remaining is not treated as terminal)
+        // THEN none are affected
         Assert.Equal(0, count);
 
         var db = await GetDbContext();
         var ops = await db.RetryableOperations.ToListAsync();
         Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "pending").Status);
-        Assert.Equal(RetryStatus.Failed, ops.Single(x => x.EntityKey == "failed-retrying").Status);
+        Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "pending-mid-retry").Status);
         Assert.Equal(RetryStatus.Completed, ops.Single(x => x.EntityKey == "completed").Status);
         Assert.Equal(RetryStatus.Superseded, ops.Single(x => x.EntityKey == "superseded").Status);
     }
@@ -1001,5 +1089,194 @@ public class RetryServiceTests : IDisposable
         var discarded = await _retryService.GetDiscardedAsync();
         Assert.Single(discarded);
         Assert.Equal(RetryStatus.Discarded, discarded[0].Status);
+    }
+
+    // ──────────────────────────────────────────
+    // BUG REGRESSION TESTS
+    // ──────────────────────────────────────────
+
+    /// <summary>
+    /// Regression: previously a COMPLETED operation would retain the LastError
+    /// from a prior failed attempt, causing the UI to display an error on a
+    /// successfully completed row.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_SuccessAfterPriorFailure_ClearsLastError()
+    {
+        // GIVEN an operation that previously failed (has a stale LastError)
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-5),
+            Status = RetryStatus.Pending,
+            NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+            MaxRetries = 3,
+            AttemptCount = 1,
+            ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+            LastError = "Shopify price update failed for SKU=SD221452" // stale error from attempt 1
+        });
+
+        // Handler succeeds this time
+        _testHandler.ShouldThrow = false;
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN operation is Completed AND LastError is cleared
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+        Assert.Null(op.LastError); // ← was previously non-null (the bug)
+        Assert.NotNull(op.CompletedAt);
+    }
+
+    /// <summary>
+    /// Regression: previously the mid-retry status was set to Failed (not Pending),
+    /// so the processor would never pick it up again — the operation was silently
+    /// abandoned despite remaining attempts.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_TransientFailure_OperationIsPickedUpOnNextRun()
+    {
+        // GIVEN an operation with 2 max retries
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null,
+            maxRetries: 2);
+
+        // WHEN attempt 1 fails transiently
+        _testHandler.ShouldThrow = true;
+        await _retryService.ProcessPendingAsync();
+
+        // THEN status must be Pending so the processor will pick it up again
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status); // ← was Failed (the bug)
+        Assert.Equal(1, op.AttemptCount);
+
+        // AND when the next run fires (after NextRetryAt), it should succeed
+        _testHandler.ShouldThrow = false;
+
+        // Fast-forward NextRetryAt so the processor picks it up now
+        op.NextRetryAt = DateTimeOffset.UtcNow.AddSeconds(-1);
+        await using (var scope = _serviceProvider.CreateAsyncScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<IRetryDbContext>();
+            ctx.RetryableOperations.Update(op);
+            await ctx.SaveChangesAsync();
+        }
+
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the operation eventually completes (was not silently abandoned)
+        var db2 = await GetDbContext();
+        var op2 = await db2.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op2.Status);
+        Assert.Equal(2, op2.AttemptCount);
+        Assert.Null(op2.LastError);
+    }
+
+    /// <summary>
+    /// Regression: Pending operations with a future NextRetryAt must NOT be
+    /// processed early, even though they are in Pending status.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_PendingWithFutureNextRetryAt_IsNotProcessed()
+    {
+        // GIVEN an operation waiting for its backoff window (e.g. after a transient failure)
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10),
+            Status = RetryStatus.Pending,
+            NextRetryAt = DateTimeOffset.UtcNow.AddMinutes(5), // ← still in the future
+            MaxRetries = 3,
+            AttemptCount = 1,
+            ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+            LastError = "Shopify price update failed for SKU=SD221452"
+        });
+
+        // WHEN we run the processor now
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler was NOT called (NextRetryAt hasn't passed yet)
+        Assert.Equal(0, _testHandler.HandleCallCount);
+
+        // AND the operation is still Pending with the same error
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status);
+        Assert.Equal(1, op.AttemptCount);
+    }
+
+    /// <summary>
+    /// Regression: an operation left in InProgress (e.g. after a process crash)
+    /// must be detected and reset to Pending so it is re-executed.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_StuckInProgress_IsResetAndReprocessed()
+    {
+        // GIVEN an operation that was set to InProgress 10 minutes ago and never updated
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-stuck",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-15),
+            Status = RetryStatus.InProgress,
+            AttemptCount = 1,
+            MaxRetries = 3,
+            ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+            // UpdatedAt in the past — older than the 5-min default threshold
+            UpdatedAt = DateTimeOffset.UtcNow.AddMinutes(-10)
+        });
+
+        // Handler succeeds on recovery
+        _testHandler.ShouldThrow = false;
+
+        // WHEN the processor runs
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the stuck op is recovered: reset to Pending, then immediately processed to Completed
+        Assert.Equal(1, _testHandler.HandleCallCount);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+        Assert.Null(op.LastError);
+    }
+
+    /// <summary>
+    /// A recently-started InProgress operation (within the stuck threshold)
+    /// must NOT be reset — it may still be running.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_RecentInProgress_IsLeftAlone()
+    {
+        // GIVEN an operation that only just started (30 seconds ago)
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-recent",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-1),
+            Status = RetryStatus.InProgress,
+            AttemptCount = 1,
+            MaxRetries = 3,
+            ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+            UpdatedAt = DateTimeOffset.UtcNow.AddSeconds(-30) // well within the 5-min threshold
+        });
+
+        // WHEN the processor runs
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler is NOT called and status is still InProgress
+        Assert.Equal(0, _testHandler.HandleCallCount);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.InProgress, op.Status);
     }
 }

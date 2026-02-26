@@ -9,15 +9,19 @@ public class RetryService : IRetryService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<RetryService> _logger;
+    private readonly TimeSpan _stuckInProgressThreshold;
     private static readonly Random Jitter = new();
     private static readonly TimeSpan DefaultMaxFailedDuration = TimeSpan.FromHours(24);
+    private static readonly TimeSpan DefaultStuckInProgressThreshold = TimeSpan.FromMinutes(5);
 
     public RetryService(
         IServiceProvider serviceProvider,
-        ILogger<RetryService> logger)
+        ILogger<RetryService> logger,
+        TimeSpan? stuckInProgressThreshold = null)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _stuckInProgressThreshold = stuckInProgressThreshold ?? DefaultStuckInProgressThreshold;
     }
 
     public async Task<bool> EnqueueAsync(
@@ -90,7 +94,29 @@ public class RetryService : IRetryService
 
         var now = DateTimeOffset.UtcNow;
 
-        // First, expire any operations that have passed their deadline
+        // Recover operations stuck in InProgress — these are operations where
+        // the processor was killed before it could save a final status.
+        // Any operation still InProgress after the threshold is assumed abandoned.
+        var stuckCutoff = now - _stuckInProgressThreshold;
+        var stuckOperations = await store.GetStuckInProgressAsync(stuckCutoff, cancellationToken);
+
+        foreach (var stuck in stuckOperations)
+        {
+            stuck.Status = RetryStatus.Pending;
+            stuck.NextRetryAt = now;
+            stuck.UpdatedAt = now;
+            _logger.LogWarning(
+                "Recovering stuck InProgress operation: {OperationName} for {EntityKey} " +
+                "(id={OperationId}, stuckSince={UpdatedAt})",
+                stuck.OperationName, stuck.EntityKey, stuck.Id, stuck.UpdatedAt);
+        }
+
+        if (stuckOperations.Count > 0)
+        {
+            await store.UpdateRangeAsync(stuckOperations, cancellationToken);
+        }
+
+        // Expire any operations that have passed their deadline
         var expiredOperations = await store.GetOperationsPastDeadlineAsync(now, cancellationToken);
 
         foreach (var expired in expiredOperations)
@@ -168,6 +194,7 @@ public class RetryService : IRetryService
                 operation.Status = RetryStatus.Completed;
                 operation.CompletedAt = DateTimeOffset.UtcNow;
                 operation.UpdatedAt = DateTimeOffset.UtcNow;
+                operation.LastError = null;
                 await store.UpdateAsync(operation, cancellationToken);
 
                 _logger.LogInformation(
@@ -188,7 +215,7 @@ public class RetryService : IRetryService
                 }
                 else
                 {
-                    operation.Status = RetryStatus.Failed;
+                    operation.Status = RetryStatus.Pending;
                     operation.NextRetryAt = CalculateNextRetry(operation.AttemptCount);
                     _logger.LogWarning(ex,
                         "Retry {Attempt}/{MaxRetries} failed for {OperationName} {EntityKey}, next retry at {NextRetryAt} (id={OperationId})",

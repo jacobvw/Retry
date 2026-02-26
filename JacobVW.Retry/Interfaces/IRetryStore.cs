@@ -34,6 +34,15 @@ public interface IRetryStore
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// Get operations that have been stuck in InProgress for longer than
+    /// <paramref name="stuckThreshold"/>. These are operations where the
+    /// processor crashed before it could update the status.
+    /// </summary>
+    Task<List<RetryableOperation>> GetStuckInProgressAsync(
+        DateTimeOffset cutoff,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// Get active operations (Pending/Failed/InProgress) that have
     /// passed their ExpiresAt deadline.
     /// </summary>
