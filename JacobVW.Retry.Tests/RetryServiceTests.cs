@@ -766,11 +766,11 @@ public class RetryServiceTests : IDisposable
     }
 
     // ──────────────────────────────────────────
-    // RETRY EXPIRED TESTS
+    // RETRY TESTS
     // ──────────────────────────────────────────
 
     [Fact]
-    public async Task RetryExpiredAsync_ReEnqueuesAllExpired()
+    public async Task RetryAsync_ReEnqueuesAllExpired()
     {
         // GIVEN two expired operations
         await SeedOperationsAsync(
@@ -792,7 +792,7 @@ public class RetryServiceTests : IDisposable
             });
 
         // WHEN we retry all expired
-        var count = await _retryService.RetryExpiredAsync();
+        var count = await _retryService.RetryAsync();
 
         // THEN both are re-enqueued
         Assert.Equal(2, count);
@@ -812,7 +812,7 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_ById_OnlyRetiresSingleOperation()
+    public async Task RetryAsync_ById_OnlyRetriesSingleOperation()
     {
         // GIVEN two expired operations
         var targetId = Guid.NewGuid();
@@ -834,7 +834,7 @@ public class RetryServiceTests : IDisposable
             });
 
         // WHEN we retry only the target
-        var count = await _retryService.RetryExpiredAsync(operationId: targetId);
+        var count = await _retryService.RetryAsync(operationId: targetId);
 
         // THEN only 1 re-enqueued
         Assert.Equal(1, count);
@@ -848,7 +848,7 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_ByOperationName_OnlyRetriesMatchingName()
+    public async Task RetryAsync_ByOperationName_OnlyRetriesMatchingName()
     {
         // GIVEN expired operations of different types
         await SeedOperationsAsync(
@@ -867,8 +867,8 @@ public class RetryServiceTests : IDisposable
                 ExpiresAt = DateTimeOffset.UtcNow.AddHours(-1)
             });
 
-        // WHEN we retry only StockUpdate expired
-        var count = await _retryService.RetryExpiredAsync(operationName: "StockUpdate");
+        // WHEN we retry only StockUpdate
+        var count = await _retryService.RetryAsync(operationName: "StockUpdate");
 
         // THEN only 1 re-enqueued
         Assert.Equal(1, count);
@@ -881,7 +881,7 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_CustomDuration_SetsNewExpiresAt()
+    public async Task RetryAsync_CustomDuration_SetsNewExpiresAt()
     {
         // GIVEN an expired operation
         await SeedOperationAsync(new RetryableOperation
@@ -895,7 +895,7 @@ public class RetryServiceTests : IDisposable
         var before = DateTimeOffset.UtcNow;
 
         // WHEN we retry with a 4-hour window
-        await _retryService.RetryExpiredAsync(newMaxFailedDuration: TimeSpan.FromHours(4));
+        await _retryService.RetryAsync(newMaxFailedDuration: TimeSpan.FromHours(4));
 
         // THEN ExpiresAt is ~4 hours from now
         var db = await GetDbContext();
@@ -905,27 +905,28 @@ public class RetryServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_NoMatches_ReturnsZero()
+    public async Task RetryAsync_NoTerminalOperations_ReturnsZero()
     {
-        // GIVEN no expired operations (only completed)
+        // GIVEN only active (Pending) operations
         await SeedOperationAsync(new RetryableOperation
         {
-            OperationName = "TestOperation", EntityKey = "ok",
+            OperationName = "TestOperation", EntityKey = "pending-1",
             EventTimestamp = DateTimeOffset.UtcNow,
-            Status = RetryStatus.Completed, MaxRetries = 3
+            Status = RetryStatus.Pending, MaxRetries = 3,
+            NextRetryAt = DateTimeOffset.UtcNow
         });
 
-        // WHEN we try to retry expired
-        var count = await _retryService.RetryExpiredAsync();
+        // WHEN we try to retry
+        var count = await _retryService.RetryAsync();
 
-        // THEN nothing is retried
+        // THEN nothing is retried (Pending is active, not terminal)
         Assert.Equal(0, count);
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_DoesNotAffectNonExpiredStatuses()
+    public async Task RetryAsync_DoesNotAffectActiveStatuses()
     {
-        // GIVEN operations in various non-expired statuses
+        // GIVEN operations in active statuses (Pending and InProgress)
         await SeedOperationsAsync(
             new RetryableOperation
             {
@@ -942,31 +943,27 @@ public class RetryServiceTests : IDisposable
             },
             new RetryableOperation
             {
-                OperationName = "TestOperation", EntityKey = "completed",
-                EventTimestamp = DateTimeOffset.UtcNow, Status = RetryStatus.Completed
-            },
-            new RetryableOperation
-            {
-                OperationName = "TestOperation", EntityKey = "superseded",
-                EventTimestamp = DateTimeOffset.UtcNow, Status = RetryStatus.Superseded
+                OperationName = "TestOperation", EntityKey = "in-progress",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                Status = RetryStatus.InProgress, AttemptCount = 1,
+                UpdatedAt = DateTimeOffset.UtcNow
             });
 
         // WHEN
-        var count = await _retryService.RetryExpiredAsync();
+        var count = await _retryService.RetryAsync();
 
-        // THEN none are affected
+        // THEN none are affected (all are active statuses)
         Assert.Equal(0, count);
 
         var db = await GetDbContext();
         var ops = await db.RetryableOperations.ToListAsync();
         Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "pending").Status);
         Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "pending-mid-retry").Status);
-        Assert.Equal(RetryStatus.Completed, ops.Single(x => x.EntityKey == "completed").Status);
-        Assert.Equal(RetryStatus.Superseded, ops.Single(x => x.EntityKey == "superseded").Status);
+        Assert.Equal(RetryStatus.InProgress, ops.Single(x => x.EntityKey == "in-progress").Status);
     }
 
     [Fact]
-    public async Task RetryExpiredAsync_ThenProcessPending_ExecutesHandler()
+    public async Task RetryAsync_ThenProcessPending_ExecutesHandler()
     {
         // GIVEN an expired operation
         await SeedOperationAsync(new RetryableOperation
@@ -979,7 +976,7 @@ public class RetryServiceTests : IDisposable
         });
 
         // WHEN we retry it, then process pending
-        await _retryService.RetryExpiredAsync();
+        await _retryService.RetryAsync();
         await _retryService.ProcessPendingAsync();
 
         // THEN the handler was called and operation completed
@@ -988,6 +985,409 @@ public class RetryServiceTests : IDisposable
         var op = await db.RetryableOperations.SingleAsync();
         Assert.Equal(RetryStatus.Completed, op.Status);
         Assert.Equal(1, op.AttemptCount); // reset from 3 to 0, then incremented to 1
+    }
+
+    // ── Retry Completed ─────────────────────────────
+
+    [Fact]
+    public async Task RetryAsync_CompletedOperation_ReEnqueues()
+    {
+        // GIVEN a completed operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "completed-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10),
+            Status = RetryStatus.Completed, MaxRetries = 3, AttemptCount = 1,
+            CompletedAt = DateTimeOffset.UtcNow.AddMinutes(-5)
+        });
+
+        // WHEN we retry it
+        var count = await _retryService.RetryAsync();
+
+        // THEN it's re-enqueued
+        Assert.Equal(1, count);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status);
+        Assert.Equal(0, op.AttemptCount);
+        Assert.Null(op.LastError);
+        Assert.NotNull(op.ExpiresAt);
+        Assert.True(op.ExpiresAt > DateTimeOffset.UtcNow);
+    }
+
+    [Fact]
+    public async Task RetryAsync_CompletedOperation_ThenProcessPending_ExecutesHandler()
+    {
+        // GIVEN a completed operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "completed-rerun",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10),
+            Status = RetryStatus.Completed, MaxRetries = 3, AttemptCount = 1,
+            CompletedAt = DateTimeOffset.UtcNow.AddMinutes(-5)
+        });
+
+        // WHEN we retry and then process
+        await _retryService.RetryAsync();
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler executes and it completes again
+        Assert.Equal(1, _testHandler.HandleCallCount);
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+    }
+
+    // ── Retry Failed ────────────────────────────────
+
+    [Fact]
+    public async Task RetryAsync_PermanentlyFailedOperation_ReEnqueues()
+    {
+        // GIVEN a permanently failed operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "failed-perm",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30),
+            Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 3,
+            LastError = "Connection timeout"
+        });
+
+        // WHEN we retry
+        var count = await _retryService.RetryAsync();
+
+        // THEN it's re-enqueued with fresh state
+        Assert.Equal(1, count);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status);
+        Assert.Equal(0, op.AttemptCount);
+        Assert.Null(op.LastError);
+    }
+
+    [Fact]
+    public async Task RetryAsync_PermanentlyFailed_ThenProcessPending_ExecutesHandler()
+    {
+        // GIVEN a permanently failed operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "failed-retry",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30),
+            Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 3,
+            LastError = "Connection timeout"
+        });
+
+        // WHEN we retry and process
+        await _retryService.RetryAsync();
+        await _retryService.ProcessPendingAsync();
+
+        // THEN it succeeds this time
+        Assert.Equal(1, _testHandler.HandleCallCount);
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+        Assert.Equal(1, op.AttemptCount);
+    }
+
+    // ── Retry Superseded ────────────────────────────
+
+    [Fact]
+    public async Task RetryAsync_SupersededOperation_ReEnqueues()
+    {
+        // GIVEN a superseded operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "superseded-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-20),
+            Status = RetryStatus.Superseded, MaxRetries = 3,
+            LastError = "Superseded by newer event"
+        });
+
+        // WHEN we retry
+        var count = await _retryService.RetryAsync();
+
+        // THEN it's re-enqueued
+        Assert.Equal(1, count);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status);
+        Assert.Equal(0, op.AttemptCount);
+        Assert.Null(op.LastError);
+    }
+
+    [Fact]
+    public async Task RetryAsync_SupersededOperation_StillSupersededIfNewerCompleted()
+    {
+        // GIVEN a superseded operation AND a newer completed event for the same entity
+        var olderTimestamp = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var newerTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-dedup",
+                EventTimestamp = olderTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-15),
+                Status = RetryStatus.Superseded, MaxRetries = 3,
+                LastError = "Superseded by newer event"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-dedup",
+                EventTimestamp = newerTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+                Status = RetryStatus.Completed, MaxRetries = 3, AttemptCount = 1,
+                CompletedAt = DateTimeOffset.UtcNow.AddMinutes(-9)
+            });
+
+        // WHEN we retry the superseded one and then process
+        var supersededOp = (await GetDbContext()).RetryableOperations
+            .Single(x => x.Status == RetryStatus.Superseded);
+        await _retryService.RetryAsync(operationId: supersededOp.Id);
+        await _retryService.ProcessPendingAsync();
+
+        // THEN it gets superseded again (deduplication still applies)
+        var db = await GetDbContext();
+        var retried = await db.RetryableOperations.SingleAsync(x => x.Id == supersededOp.Id);
+        Assert.Equal(RetryStatus.Superseded, retried.Status);
+        Assert.Equal(0, _testHandler.HandleCallCount); // handler not called
+    }
+
+    [Fact]
+    public async Task RetryAsync_SupersededOperation_CompletesIfNoNewerCompleted()
+    {
+        // GIVEN a superseded operation with NO newer completed event
+        // (the newer event also failed, so deduplication won't block)
+        var olderTimestamp = DateTimeOffset.UtcNow.AddMinutes(-20);
+        var newerTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-no-newer",
+                EventTimestamp = olderTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-15),
+                Status = RetryStatus.Superseded, MaxRetries = 3,
+                LastError = "Superseded by newer event"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-no-newer",
+                EventTimestamp = newerTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+                Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 3,
+                LastError = "Permanent failure"
+            });
+
+        // WHEN we retry the superseded one and then process
+        var supersededOp = (await GetDbContext()).RetryableOperations
+            .Single(x => x.Status == RetryStatus.Superseded);
+        await _retryService.RetryAsync(operationId: supersededOp.Id);
+        await _retryService.ProcessPendingAsync();
+
+        // THEN it completes (no newer completed event blocks it)
+        var db = await GetDbContext();
+        var retried = await db.RetryableOperations.SingleAsync(x => x.Id == supersededOp.Id);
+        Assert.Equal(RetryStatus.Completed, retried.Status);
+        Assert.Equal(1, _testHandler.HandleCallCount);
+    }
+
+    // ── Retry Discarded ─────────────────────────────
+
+    [Fact]
+    public async Task RetryAsync_DiscardedOperation_ReEnqueues()
+    {
+        // GIVEN a discarded operation
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "discarded-1",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30),
+            Status = RetryStatus.Discarded, MaxRetries = 3,
+            LastError = "Discarded: a newer event already exists"
+        });
+
+        // WHEN we retry
+        var count = await _retryService.RetryAsync();
+
+        // THEN it's re-enqueued
+        Assert.Equal(1, count);
+
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Pending, op.Status);
+        Assert.Equal(0, op.AttemptCount);
+        Assert.Null(op.LastError);
+    }
+
+    [Fact]
+    public async Task RetryAsync_DiscardedOperation_ThenProcessPending_ExecutesHandler()
+    {
+        // GIVEN a discarded operation with no newer completed event
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation", EntityKey = "discarded-run",
+            EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30),
+            Status = RetryStatus.Discarded, MaxRetries = 3,
+            LastError = "Discarded: a newer event already exists",
+            SerializedPayload = "{\"data\":true}"
+        });
+
+        // WHEN we retry and process
+        await _retryService.RetryAsync();
+        await _retryService.ProcessPendingAsync();
+
+        // THEN handler is called and it completes
+        Assert.Equal(1, _testHandler.HandleCallCount);
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+    }
+
+    [Fact]
+    public async Task RetryAsync_DiscardedOperation_SupersededIfNewerCompleted()
+    {
+        // GIVEN a discarded (older) operation AND a completed newer event
+        var olderTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30);
+        var newerTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-disc-dedup",
+                EventTimestamp = olderTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-25),
+                Status = RetryStatus.Discarded, MaxRetries = 3,
+                LastError = "Discarded: a newer event already exists"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "entity-disc-dedup",
+                EventTimestamp = newerTimestamp,
+                CreatedAt = DateTimeOffset.UtcNow.AddMinutes(-10),
+                Status = RetryStatus.Completed, MaxRetries = 3, AttemptCount = 1,
+                CompletedAt = DateTimeOffset.UtcNow.AddMinutes(-9)
+            });
+
+        // WHEN we retry the discarded one and process
+        var discardedOp = (await GetDbContext()).RetryableOperations
+            .Single(x => x.Status == RetryStatus.Discarded);
+        await _retryService.RetryAsync(operationId: discardedOp.Id);
+        await _retryService.ProcessPendingAsync();
+
+        // THEN it gets superseded (deduplication still applies)
+        var db = await GetDbContext();
+        var retried = await db.RetryableOperations.SingleAsync(x => x.Id == discardedOp.Id);
+        Assert.Equal(RetryStatus.Superseded, retried.Status);
+        Assert.Equal(0, _testHandler.HandleCallCount);
+    }
+
+    // ── Mixed terminal statuses ─────────────────────
+
+    [Fact]
+    public async Task RetryAsync_MixedTerminalStatuses_RetriesAll()
+    {
+        // GIVEN operations in every terminal status
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "completed",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-50),
+                Status = RetryStatus.Completed, MaxRetries = 3, AttemptCount = 1
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "failed",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-40),
+                Status = RetryStatus.Failed, MaxRetries = 3, AttemptCount = 3,
+                LastError = "Permanent failure"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "expired",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-30),
+                Status = RetryStatus.Expired, MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(-1)
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "superseded",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-20),
+                Status = RetryStatus.Superseded, MaxRetries = 3,
+                LastError = "Superseded by newer event"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "discarded",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10),
+                Status = RetryStatus.Discarded, MaxRetries = 3,
+                LastError = "Discarded: a newer event already exists"
+            });
+
+        // WHEN we retry all
+        var count = await _retryService.RetryAsync();
+
+        // THEN all 5 terminal operations are re-enqueued
+        Assert.Equal(5, count);
+
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        Assert.All(ops, op =>
+        {
+            Assert.Equal(RetryStatus.Pending, op.Status);
+            Assert.Equal(0, op.AttemptCount);
+            Assert.Null(op.LastError);
+        });
+    }
+
+    [Fact]
+    public async Task RetryAsync_MixedActiveAndTerminal_OnlyRetriesTerminal()
+    {
+        // GIVEN a mix of active and terminal operations
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "active-pending",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                Status = RetryStatus.Pending, MaxRetries = 3,
+                NextRetryAt = DateTimeOffset.UtcNow
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "active-inprogress",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                Status = RetryStatus.InProgress, AttemptCount = 1,
+                UpdatedAt = DateTimeOffset.UtcNow
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "terminal-failed",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-10),
+                Status = RetryStatus.Failed, MaxRetries = 1, AttemptCount = 1,
+                LastError = "Timeout"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation", EntityKey = "terminal-superseded",
+                EventTimestamp = DateTimeOffset.UtcNow.AddMinutes(-20),
+                Status = RetryStatus.Superseded, MaxRetries = 3
+            });
+
+        // WHEN
+        var count = await _retryService.RetryAsync();
+
+        // THEN only the 2 terminal operations are retried
+        Assert.Equal(2, count);
+
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        // Active ones unchanged
+        Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "active-pending").Status);
+        Assert.Equal(RetryStatus.InProgress, ops.Single(x => x.EntityKey == "active-inprogress").Status);
+        // Terminal ones re-enqueued
+        Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "terminal-failed").Status);
+        Assert.Equal(RetryStatus.Pending, ops.Single(x => x.EntityKey == "terminal-superseded").Status);
     }
 
     // ──────────────────────────────────────────

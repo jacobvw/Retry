@@ -93,9 +93,10 @@ public interface IRetryStore
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Get expired operations, optionally filtered by ID and/or operation name.
+    /// Get terminal (non-active) operations, optionally filtered by ID and/or
+    /// operation name. Excludes Pending and InProgress operations.
     /// </summary>
-    Task<List<RetryableOperation>> GetExpiredByFilterAsync(
+    Task<List<RetryableOperation>> GetByFilterAsync(
         Guid? operationId = null,
         string? operationName = null,
         CancellationToken cancellationToken = default);

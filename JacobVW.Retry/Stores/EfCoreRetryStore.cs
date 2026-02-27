@@ -170,14 +170,15 @@ public class EfCoreRetryStore : IRetryStore
             .ToDictionary(g => g.Key, g => g.Count());
     }
 
-    public async Task<List<RetryableOperation>> GetExpiredByFilterAsync(
+    public async Task<List<RetryableOperation>> GetByFilterAsync(
         Guid? operationId = null,
         string? operationName = null,
         CancellationToken cancellationToken = default)
     {
+        // Exclude active statuses — only terminal operations can be retried
         var query = _dbContext.RetryableOperations
-            .Where(x => x.Status == RetryStatus.Expired
-                        || (x.Status == RetryStatus.Failed && x.AttemptCount >= x.MaxRetries));
+            .Where(x => x.Status != RetryStatus.Pending
+                        && x.Status != RetryStatus.InProgress);
 
         if (operationId.HasValue)
         {

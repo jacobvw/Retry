@@ -284,7 +284,7 @@ public class RetryService : IRetryService
         return await store.GetStatusCountsAsync(operationName, cancellationToken);
     }
 
-    public async Task<int> RetryExpiredAsync(
+    public async Task<int> RetryAsync(
         Guid? operationId = null,
         string? operationName = null,
         TimeSpan? newMaxFailedDuration = null,
@@ -296,10 +296,11 @@ public class RetryService : IRetryService
         var now = DateTimeOffset.UtcNow;
         var newExpiresAt = now + (newMaxFailedDuration ?? DefaultMaxFailedDuration);
 
-        var expiredOps = await store.GetExpiredByFilterAsync(operationId, operationName, cancellationToken);
+        var terminalOps = await store.GetByFilterAsync(operationId, operationName, cancellationToken);
 
-        foreach (var op in expiredOps)
+        foreach (var op in terminalOps)
         {
+            var previousStatus = op.Status;
             op.Status = RetryStatus.Pending;
             op.AttemptCount = 0;
             op.NextRetryAt = now;
@@ -308,16 +309,16 @@ public class RetryService : IRetryService
             op.UpdatedAt = now;
 
             _logger.LogInformation(
-                "Re-enqueued expired operation {OperationName} for {EntityKey} (id={Id}, new expiry={ExpiresAt})",
-                op.OperationName, op.EntityKey, op.Id, newExpiresAt);
+                "Re-enqueued {PreviousStatus} operation {OperationName} for {EntityKey} (id={Id}, new expiry={ExpiresAt})",
+                previousStatus, op.OperationName, op.EntityKey, op.Id, newExpiresAt);
         }
 
-        if (expiredOps.Count > 0)
+        if (terminalOps.Count > 0)
         {
-            await store.UpdateRangeAsync(expiredOps, cancellationToken);
+            await store.UpdateRangeAsync(terminalOps, cancellationToken);
         }
 
-        return expiredOps.Count;
+        return terminalOps.Count;
     }
 
     /// <summary>

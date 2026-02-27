@@ -84,16 +84,19 @@ public interface IRetryService
         CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Re-enqueue expired operations for another attempt.
+    /// Re-enqueue terminal operations for another attempt.
     /// Resets status to Pending, extends ExpiresAt by the given duration,
-    /// and resets attempt count.
+    /// and resets attempt count. Any non-active operation (Completed, Failed,
+    /// Expired, Superseded, Discarded) can be retried. Deduplication checks
+    /// during processing still apply — e.g. a retried Superseded event will
+    /// be superseded again if the newer completed event still exists.
     /// </summary>
     /// <param name="operationId">Optional: retry a single operation by ID</param>
-    /// <param name="operationName">Optional: retry all expired operations matching this name</param>
+    /// <param name="operationName">Optional: retry all terminal operations matching this name</param>
     /// <param name="newMaxFailedDuration">New expiry window from now (default: 24 hours)</param>
     /// <param name="cancellationToken">Cancellation token</param>
     /// <returns>Number of operations re-enqueued</returns>
-    Task<int> RetryExpiredAsync(
+    Task<int> RetryAsync(
         Guid? operationId = null,
         string? operationName = null,
         TimeSpan? newMaxFailedDuration = null,
