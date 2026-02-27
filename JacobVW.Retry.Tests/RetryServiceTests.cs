@@ -1092,6 +1092,292 @@ public class RetryServiceTests : IDisposable
     }
 
     // ──────────────────────────────────────────
+    // SAME-TIMESTAMP EVENT TESTS
+    // ──────────────────────────────────────────
+
+    [Fact]
+    public async Task EnqueueAsync_SameTimestamp_BothEnqueued()
+    {
+        // GIVEN an event at timestamp T
+        var timestamp = DateTimeOffset.UtcNow;
+        var result1 = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: timestamp,
+            serializedPayload: "{\"first\":true}");
+
+        // WHEN a second event arrives at the same timestamp
+        var result2 = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: timestamp,
+            serializedPayload: "{\"second\":true}");
+
+        // THEN both are enqueued (not discarded)
+        Assert.True(result1);
+        Assert.True(result2);
+
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        Assert.Equal(2, ops.Count);
+        Assert.All(ops, op => Assert.Equal(RetryStatus.Pending, op.Status));
+    }
+
+    [Fact]
+    public async Task ProcessPending_SameTimestamp_LaterCreatedSupersedes()
+    {
+        // GIVEN two events with the same EventTimestamp but different CreatedAt
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var earlierCreated = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var laterCreated = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = earlierCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1), // processes second
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = laterCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-2), // processes first
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            });
+
+        // WHEN we process — later-created completes first
+        await _retryService.ProcessPendingAsync();
+
+        // THEN earlier-created is superseded by the later-created completed event
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations
+            .OrderBy(x => x.CreatedAt)
+            .ToListAsync();
+
+        var earlier = ops[0];
+        var later = ops[1];
+
+        Assert.Equal(RetryStatus.Superseded, earlier.Status);
+        Assert.Equal(RetryStatus.Completed, later.Status);
+    }
+
+    [Fact]
+    public async Task ProcessPending_SameTimestamp_EarlierCreatedCompletesFirst_BothComplete()
+    {
+        // GIVEN two events with the same EventTimestamp but different CreatedAt
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var earlierCreated = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var laterCreated = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = earlierCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-2), // processes first
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = laterCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1), // processes second
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            });
+
+        // WHEN we process — earlier-created completes first
+        await _retryService.ProcessPendingAsync();
+
+        // THEN later-created is NOT superseded (it has the newer CreatedAt)
+        // Both end up Completed since the handler always API-fetches fresh data
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations
+            .OrderBy(x => x.CreatedAt)
+            .ToListAsync();
+
+        var earlier = ops[0];
+        var later = ops[1];
+
+        Assert.Equal(RetryStatus.Completed, earlier.Status);
+        Assert.Equal(RetryStatus.Completed, later.Status);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_SameTimestamp_AfterCompletion_StillEnqueued()
+    {
+        // GIVEN an event at timestamp T that has already been processed to Completed
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: timestamp,
+            serializedPayload: "{\"first\":true}");
+        await _retryService.ProcessPendingAsync();
+
+        // WHEN a second event arrives at the same timestamp
+        var result = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: timestamp,
+            serializedPayload: "{\"second\":true}");
+
+        // THEN it is still enqueued (same timestamp is not blocked by >)
+        Assert.True(result);
+
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        Assert.Equal(2, ops.Count);
+        Assert.Single(ops, x => x.Status == RetryStatus.Completed);
+        Assert.Single(ops, x => x.Status == RetryStatus.Pending);
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_SameTimestamp_WhileInProgress_StillEnqueued()
+    {
+        // GIVEN an event at timestamp T that is currently InProgress
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "entity-1",
+            EventTimestamp = timestamp,
+            Status = RetryStatus.InProgress,
+            AttemptCount = 1,
+            MaxRetries = 3,
+            ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+            UpdatedAt = DateTimeOffset.UtcNow // recently started, not stuck
+        });
+
+        // WHEN a second event arrives at the same timestamp
+        var result = await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: timestamp,
+            serializedPayload: "{\"second\":true}");
+
+        // THEN it is still enqueued (same timestamp is not blocked by >)
+        Assert.True(result);
+
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations.ToListAsync();
+        Assert.Equal(2, ops.Count);
+        Assert.Single(ops, x => x.Status == RetryStatus.InProgress);
+        Assert.Single(ops, x => x.Status == RetryStatus.Pending);
+    }
+
+    [Fact]
+    public async Task ProcessPending_SameTimestamp_EarlierCreatedFailsPermanently_LaterCreatedStillCompletes()
+    {
+        // GIVEN two events with the same EventTimestamp
+        // The earlier-created one has already permanently failed
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var earlierCreated = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var laterCreated = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = earlierCreated,
+                Status = RetryStatus.Failed,  // permanently failed
+                AttemptCount = 3,
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+                LastError = "Permanent failure"
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = laterCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            });
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN later-created completes (Failed does NOT supersede)
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations
+            .OrderBy(x => x.CreatedAt)
+            .ToListAsync();
+
+        Assert.Equal(RetryStatus.Failed, ops[0].Status);     // earlier stays Failed
+        Assert.Equal(RetryStatus.Completed, ops[1].Status);   // later completes normally
+    }
+
+    [Fact]
+    public async Task ProcessPending_SameTimestamp_LaterCreatedFailsPermanently_EarlierCreatedStillCompletes()
+    {
+        // GIVEN two events with the same EventTimestamp
+        // The later-created one has already permanently failed
+        var timestamp = DateTimeOffset.UtcNow.AddMinutes(-5);
+        var earlierCreated = DateTimeOffset.UtcNow.AddMinutes(-2);
+        var laterCreated = DateTimeOffset.UtcNow.AddMinutes(-1);
+
+        await SeedOperationsAsync(
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = earlierCreated,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            },
+            new RetryableOperation
+            {
+                OperationName = "TestOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = timestamp,
+                CreatedAt = laterCreated,
+                Status = RetryStatus.Failed,  // permanently failed
+                AttemptCount = 3,
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24),
+                LastError = "Permanent failure"
+            });
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN earlier-created completes (Failed does NOT supersede)
+        var db = await GetDbContext();
+        var ops = await db.RetryableOperations
+            .OrderBy(x => x.CreatedAt)
+            .ToListAsync();
+
+        Assert.Equal(RetryStatus.Completed, ops[0].Status);  // earlier completes normally
+        Assert.Equal(RetryStatus.Failed, ops[1].Status);      // later stays Failed
+    }
+
+    // ──────────────────────────────────────────
     // BUG REGRESSION TESTS
     // ──────────────────────────────────────────
 
@@ -1279,4 +1565,67 @@ public class RetryServiceTests : IDisposable
         var op = await db.RetryableOperations.SingleAsync();
         Assert.Equal(RetryStatus.InProgress, op.Status);
     }
+
+    /// <summary>
+    /// Regression: if the handler's DI construction throws, the exception was
+    /// previously unhandled (outside the try/catch), leaving the operation in
+    /// InProgress with AttemptCount incremented but no LastError and no handler
+    /// invocation. Now it is caught, LastError is set, and status is updated.
+    /// </summary>
+    [Fact]
+    public async Task ProcessPending_HandlerConstructionThrows_RecordedAsFailed()
+    {
+        // GIVEN a service setup where the handler registration throws on construction
+        var services = new ServiceCollection();
+        var dbName = $"RetryTestDb_BrokenHandler_{Guid.NewGuid()}";
+        services.AddDbContext<TestDbContext>(opts => opts.UseInMemoryDatabase(dbName));
+        services.AddScoped<IRetryDbContext>(sp => sp.GetRequiredService<TestDbContext>());
+        services.AddScoped<IRetryStore, EfCoreRetryStore>();
+
+        var registry = new RetryHandlerRegistry();
+        registry.Register("BrokenOperation", typeof(BrokenConstructorHandler));
+        services.AddSingleton(registry);
+        // BrokenConstructorHandler is NOT registered in DI — GetRequiredService will throw
+        services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug));
+
+        await using var sp = services.BuildServiceProvider();
+        var retryService = new RetryService(sp, sp.GetRequiredService<ILogger<RetryService>>());
+
+        // Seed a pending operation for the broken handler
+        await using (var scope = sp.CreateAsyncScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<IRetryDbContext>();
+            db.RetryableOperations.Add(new RetryableOperation
+            {
+                OperationName = "BrokenOperation",
+                EntityKey = "entity-1",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                Status = RetryStatus.Pending,
+                NextRetryAt = DateTimeOffset.UtcNow.AddHours(-1),
+                MaxRetries = 3,
+                ExpiresAt = DateTimeOffset.UtcNow.AddHours(24)
+            });
+            await db.SaveChangesAsync();
+        }
+
+        // WHEN we process — handler DI resolution will throw
+        await retryService.ProcessPendingAsync();
+
+        // THEN the operation is NOT stuck in InProgress — it's Pending (retryable)
+        // with a LastError explaining what went wrong
+        await using var verifyScope = sp.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<TestDbContext>();
+        var op = await verifyDb.RetryableOperations.SingleAsync();
+        Assert.NotEqual(RetryStatus.InProgress, op.Status); // not stuck
+        Assert.Equal(1, op.AttemptCount);                   // attempt was counted
+        Assert.NotNull(op.LastError);                       // error was recorded
+    }
+}
+
+/// <summary>Helper: a handler type intentionally NOT registered in DI to simulate construction failure.</summary>
+internal class BrokenConstructorHandler : IRetryOperationHandler
+{
+    public static string OperationName => "BrokenOperation";
+    public Task HandleAsync(RetryableOperation operation, CancellationToken cancellationToken = default)
+        => Task.CompletedTask;
 }

@@ -14,10 +14,12 @@ public interface IRetryStore
     // ── Queries ──────────────────────────────────────────
 
     /// <summary>
-    /// Check if a newer or equal non-failed event already exists
+    /// Check if a strictly newer non-failed event already exists
     /// for this entity + operation combination.
+    /// Same-timestamp events are allowed through — CreatedAt ordering
+    /// during processing determines which one wins.
     /// </summary>
-    Task<bool> HasNewerOrEqualEventAsync(
+    Task<bool> HasNewerEventAsync(
         string operationName,
         string entityKey,
         DateTimeOffset eventTimestamp,
@@ -26,11 +28,14 @@ public interface IRetryStore
     /// <summary>
     /// Check if a newer completed event exists for this entity + operation.
     /// Used for supersede detection during processing.
+    /// A completed event supersedes if it has a strictly newer EventTimestamp,
+    /// or the same EventTimestamp but a later CreatedAt.
     /// </summary>
     Task<bool> HasNewerCompletedEventAsync(
         string operationName,
         string entityKey,
         DateTimeOffset eventTimestamp,
+        DateTimeOffset createdAt,
         CancellationToken cancellationToken = default);
 
     /// <summary>

@@ -36,9 +36,10 @@ public class RetryService : IRetryService
         await using var scope = _serviceProvider.CreateAsyncScope();
         var store = scope.ServiceProvider.GetRequiredService<IRetryStore>();
 
-        // Check if a newer or equal event for this entity has already been
-        // completed or is pending — if so, skip this stale event
-        var existingNewer = await store.HasNewerOrEqualEventAsync(
+        // Check if a strictly newer event for this entity has already been
+        // completed or is pending — if so, skip this stale event.
+        // Same-timestamp events are allowed through.
+        var existingNewer = await store.HasNewerEventAsync(
             operationName, entityKey, eventTimestamp, cancellationToken);
 
         if (existingNewer)
@@ -52,12 +53,12 @@ public class RetryService : IRetryService
                 SerializedPayload = serializedPayload,
                 MaxRetries = maxRetries,
                 Status = RetryStatus.Discarded,
-                LastError = $"Discarded: a newer or equal event already exists for {operationName}/{entityKey}"
+                LastError = $"Discarded: a newer event already exists for {operationName}/{entityKey}"
             };
             await store.AddAsync(discardedOp, cancellationToken);
 
             _logger.LogDebug(
-                "Discarded stale {OperationName} for {EntityKey}: event={EventTimestamp}, a newer or equal event already exists",
+                "Discarded stale {OperationName} for {EntityKey}: event={EventTimestamp}, a newer event already exists",
                 operationName, entityKey, eventTimestamp);
             return false;
         }
@@ -148,10 +149,10 @@ public class RetryService : IRetryService
 
         foreach (var operation in pendingOperations)
         {
-            // Skip if a newer event for the same entity has already completed
+            // Skip if a newer event (or same-timestamp but later-received) has already completed
             var superseded = await store.HasNewerCompletedEventAsync(
                 operation.OperationName, operation.EntityKey,
-                operation.EventTimestamp, cancellationToken);
+                operation.EventTimestamp, operation.CreatedAt, cancellationToken);
 
             if (superseded)
             {
@@ -180,8 +181,6 @@ public class RetryService : IRetryService
                 continue;
             }
 
-            var handler = (IRetryOperationHandler)scope.ServiceProvider.GetRequiredService(handlerType);
-
             operation.Status = RetryStatus.InProgress;
             operation.AttemptCount++;
             operation.UpdatedAt = now;
@@ -189,6 +188,10 @@ public class RetryService : IRetryService
 
             try
             {
+                // Resolve inside the try so DI construction failures are
+                // caught and recorded as a proper attempt, not a phantom one.
+                var handler = (IRetryOperationHandler)scope.ServiceProvider.GetRequiredService(handlerType);
+
                 await handler.HandleAsync(operation, cancellationToken);
 
                 operation.Status = RetryStatus.Completed;

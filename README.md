@@ -6,6 +6,7 @@ DB-backed retry service with timestamp-aware idempotency for .NET applications.
 
 - **Pluggable storage backend** — ships with EF Core, implement `IRetryStore` for Redis/MongoDB/etc.
 - **Timestamp-aware deduplication** — out-of-order events are stored as `Discarded` for auditing
+- **Same-timestamp support** — multiple events at the same timestamp are all processed; `CreatedAt` is used as a tiebreaker
 - **Expiry mechanism** — operations stop retrying after a configurable deadline
 - **Supersede detection** — older events are marked `Superseded` when newer ones complete
 - **Exponential backoff with jitter** — prevents thundering herd on retries
@@ -129,9 +130,26 @@ await retryService.RetryExpiredAsync(
 | `Failed` | Handler threw — will retry if attempts remain |
 | `Expired` | Past `ExpiresAt` deadline, stopped retrying |
 | `Superseded` | A newer event for the same entity completed during processing |
-| `Discarded` | Stale event — a newer or equal event already existed at enqueue time |
+| `Discarded` | Stale event — a strictly newer event already existed at enqueue time |
 
 > **Superseded vs Discarded:** `Discarded` events are caught at enqueue time (never processed). `Superseded` events were queued first but a newer event completed before they were processed.
+
+## Same-Timestamp Events
+
+When multiple events arrive for the same entity with identical `EventTimestamp` values (e.g. a webhook provider fires multiple updates simultaneously):
+
+1. **Enqueue** — all same-timestamp events are accepted. Only a *strictly newer* timestamp blocks enqueue.
+2. **Processing** — `CreatedAt` (set automatically when the operation is created) acts as a tiebreaker. If a same-timestamp event with a later `CreatedAt` has already completed, earlier-created events are marked `Superseded`.
+3. **Handlers should be idempotent** — since same-timestamp events both run, handlers should fetch the latest state from the source API rather than relying on the webhook payload.
+
+```
+Event A (timestamp=T, CreatedAt=09:00:01) ─┐
+                                            ├─ Both enqueued as Pending
+Event B (timestamp=T, CreatedAt=09:00:02) ─┘
+
+If B completes first → A is Superseded (B has later CreatedAt)
+If A completes first → B also completes  (B has later CreatedAt, not superseded)
+```
 
 ## Custom Storage Backend
 

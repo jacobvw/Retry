@@ -22,22 +22,22 @@ public class EfCoreRetryStore : IRetryStore
 
     // ── Queries ──────────────────────────────────────────
 
-    public async Task<bool> HasNewerOrEqualEventAsync(
+    public async Task<bool> HasNewerEventAsync(
         string operationName,
         string entityKey,
         DateTimeOffset eventTimestamp,
         CancellationToken cancellationToken = default)
     {
-        // Block re-enqueueing if there's already an active or completed record at the
-        // same-or-newer timestamp: Pending (mid-retry), InProgress (running), or Completed
-        // (already done — deduplicates webhook replays at the same timestamp).
+        // Block re-enqueueing only if there's a strictly newer event.
+        // Same-timestamp events are allowed through — CreatedAt ordering
+        // during processing determines which one wins.
         // Expired, Superseded, Discarded, and permanently-Failed records do NOT block, so
         // a genuine new incoming event for the same entity can still be processed.
         return await _dbContext.RetryableOperations
             .AnyAsync(
                 x => x.EntityKey == entityKey
                      && x.OperationName == operationName
-                     && x.EventTimestamp >= eventTimestamp
+                     && x.EventTimestamp > eventTimestamp
                      && (x.Status == RetryStatus.Pending
                          || x.Status == RetryStatus.InProgress
                          || x.Status == RetryStatus.Completed),
@@ -48,14 +48,20 @@ public class EfCoreRetryStore : IRetryStore
         string operationName,
         string entityKey,
         DateTimeOffset eventTimestamp,
+        DateTimeOffset createdAt,
         CancellationToken cancellationToken = default)
     {
+        // Supersede if a completed event exists that is either:
+        // (a) strictly newer by event timestamp, OR
+        // (b) same event timestamp but received later (by CreatedAt)
         return await _dbContext.RetryableOperations
             .AnyAsync(
                 x => x.EntityKey == entityKey
                      && x.OperationName == operationName
-                     && x.EventTimestamp > eventTimestamp
-                     && x.Status == RetryStatus.Completed,
+                     && x.Status == RetryStatus.Completed
+                     && (x.EventTimestamp > eventTimestamp
+                         || (x.EventTimestamp == eventTimestamp
+                             && x.CreatedAt > createdAt)),
                 cancellationToken);
     }
 
