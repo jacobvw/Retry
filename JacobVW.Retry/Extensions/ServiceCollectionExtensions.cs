@@ -87,6 +87,7 @@ public static class ServiceCollectionExtensions
         TimeSpan? processingInterval)
     {
         services.AddSingleton<RetryHandlerRegistry>();
+        services.AddSingleton<RetrySignal>();
 
         services.AddScoped<IRetryService, RetryService>();
 
@@ -94,6 +95,7 @@ public static class ServiceCollectionExtensions
             new RetryProcessorService(
                 serviceProvider: sp,
                 logger: sp.GetRequiredService<Microsoft.Extensions.Logging.ILogger<RetryProcessorService>>(),
+                signal: sp.GetRequiredService<RetrySignal>(),
                 interval: processingInterval));
 
         services.AddSingleton<IHostedService>(sp =>

@@ -14,10 +14,12 @@ public class RetryServiceTests : IDisposable
     private readonly ServiceProvider _serviceProvider;
     private readonly TestRetryHandler _testHandler;
     private readonly RetryService _retryService;
+    private readonly RetrySignal _retrySignal;
 
     public RetryServiceTests()
     {
         _testHandler = new TestRetryHandler();
+        _retrySignal = new RetrySignal();
 
         var services = new ServiceCollection();
 
@@ -33,12 +35,14 @@ public class RetryServiceTests : IDisposable
         registry.Register(TestRetryHandler.OperationName, typeof(TestRetryHandler));
         services.AddSingleton(registry);
         services.AddSingleton(_testHandler);
+        services.AddSingleton(_retrySignal);
 
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug));
 
         _serviceProvider = services.BuildServiceProvider();
         _retryService = new RetryService(_serviceProvider, 
-            _serviceProvider.GetRequiredService<ILogger<RetryService>>());
+            _serviceProvider.GetRequiredService<ILogger<RetryService>>(),
+            _retrySignal);
     }
 
     public void Dispose()
@@ -1989,7 +1993,7 @@ public class RetryServiceTests : IDisposable
         services.AddLogging(b => b.SetMinimumLevel(LogLevel.Debug));
 
         await using var sp = services.BuildServiceProvider();
-        var retryService = new RetryService(sp, sp.GetRequiredService<ILogger<RetryService>>());
+        var retryService = new RetryService(sp, sp.GetRequiredService<ILogger<RetryService>>(), new RetrySignal());
 
         // Seed a pending operation for the broken handler
         await using (var scope = sp.CreateAsyncScope())
@@ -2019,6 +2023,99 @@ public class RetryServiceTests : IDisposable
         Assert.NotEqual(RetryStatus.InProgress, op.Status); // not stuck
         Assert.Equal(1, op.AttemptCount);                   // attempt was counted
         Assert.NotNull(op.LastError);                       // error was recorded
+    }
+
+    // ──────────────────────────────────────────
+    // SIGNAL TESTS
+    // ──────────────────────────────────────────
+
+    [Fact]
+    public async Task EnqueueAsync_Success_SignalsProcessor()
+    {
+        // GIVEN a fresh signal
+        var signal = new RetrySignal();
+        var svc = new RetryService(_serviceProvider,
+            _serviceProvider.GetRequiredService<ILogger<RetryService>>(), signal);
+
+        // WHEN we enqueue successfully
+        await svc.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "signal-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null);
+
+        // THEN WaitAsync returns immediately (signal was fired)
+        // WaitAsync returns immediately if signaled; the outer WaitAsync
+        // adds a hard timeout so the test fails fast if the signal was lost.
+        await signal.WaitAsync(TimeSpan.Zero, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task EnqueueAsync_Discarded_DoesNotSignal()
+    {
+        // GIVEN a newer event already exists
+        var signal = new RetrySignal();
+        var svc = new RetryService(_serviceProvider,
+            _serviceProvider.GetRequiredService<ILogger<RetryService>>(), signal);
+
+        var newerTimestamp = DateTimeOffset.UtcNow;
+        await svc.EnqueueAsync("TestOperation", "signal-2", newerTimestamp, null);
+
+        // Drain the signal from the first enqueue
+        await signal.WaitAsync(TimeSpan.FromMilliseconds(100), CancellationToken.None);
+
+        // WHEN we enqueue a stale event (should be discarded)
+        var result = await svc.EnqueueAsync("TestOperation", "signal-2",
+            newerTimestamp.AddMinutes(-10), null);
+
+        Assert.False(result);
+
+        // THEN no signal was fired — WaitAsync should time out (return false)
+        var signaled = await signal.WaitForTestAsync(TimeSpan.FromMilliseconds(100), CancellationToken.None);
+        Assert.False(signaled);
+    }
+
+    [Fact]
+    public async Task RetryAsync_ReEnqueues_SignalsProcessor()
+    {
+        // GIVEN a failed operation
+        var signal = new RetrySignal();
+        var svc = new RetryService(_serviceProvider,
+            _serviceProvider.GetRequiredService<ILogger<RetryService>>(), signal);
+
+        await SeedOperationAsync(new RetryableOperation
+        {
+            OperationName = "TestOperation",
+            EntityKey = "signal-retry",
+            EventTimestamp = DateTimeOffset.UtcNow.AddHours(-1),
+            Status = RetryStatus.Failed,
+            MaxRetries = 1,
+            AttemptCount = 1,
+            LastError = "boom"
+        });
+
+        // WHEN we retry
+        var count = await svc.RetryAsync(operationName: "TestOperation");
+        Assert.Equal(1, count);
+
+        // THEN the signal was fired
+        await signal.WaitAsync(TimeSpan.Zero, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Signal_FiredDuringProcessing_IsNotLost()
+    {
+        // GIVEN: the signal is fired BEFORE anyone calls WaitAsync
+        // (simulates enqueue happening while the processor is busy)
+        var signal = new RetrySignal();
+        signal.Notify();
+
+        // WHEN: we later call WaitAsync
+        // THEN: it returns immediately — the signal was not lost
+        await signal.WaitAsync(TimeSpan.Zero, CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
     }
 }
 

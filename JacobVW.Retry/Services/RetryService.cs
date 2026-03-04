@@ -9,6 +9,7 @@ public class RetryService : IRetryService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<RetryService> _logger;
+    private readonly RetrySignal _signal;
     private readonly TimeSpan _stuckInProgressThreshold;
     private static readonly Random Jitter = new();
     private static readonly TimeSpan DefaultMaxFailedDuration = TimeSpan.FromHours(24);
@@ -17,10 +18,12 @@ public class RetryService : IRetryService
     public RetryService(
         IServiceProvider serviceProvider,
         ILogger<RetryService> logger,
+        RetrySignal signal,
         TimeSpan? stuckInProgressThreshold = null)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _signal = signal;
         _stuckInProgressThreshold = stuckInProgressThreshold ?? DefaultStuckInProgressThreshold;
     }
 
@@ -84,6 +87,7 @@ public class RetryService : IRetryService
             "Enqueued {OperationName} for {EntityKey} (timestamp={EventTimestamp}, expires={ExpiresAt})",
             operationName, entityKey, eventTimestamp, expiresAt);
 
+        _signal.Notify();
         return true;
     }
 
@@ -316,6 +320,7 @@ public class RetryService : IRetryService
         if (terminalOps.Count > 0)
         {
             await store.UpdateRangeAsync(terminalOps, cancellationToken);
+            _signal.Notify();
         }
 
         return terminalOps.Count;

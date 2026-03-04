@@ -13,15 +13,18 @@ public class RetryProcessorService : BackgroundService
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ILogger<RetryProcessorService> _logger;
+    private readonly RetrySignal _signal;
     private readonly TimeSpan _interval;
 
     public RetryProcessorService(
         IServiceProvider serviceProvider,
         ILogger<RetryProcessorService> logger,
+        RetrySignal signal,
         TimeSpan? interval = null)
     {
         _serviceProvider = serviceProvider;
         _logger = logger;
+        _signal = signal;
         _interval = interval ?? TimeSpan.FromSeconds(30);
     }
 
@@ -44,7 +47,17 @@ public class RetryProcessorService : BackgroundService
                 _logger.LogError(ex, "Error processing pending retry operations");
             }
 
-            await Task.Delay(_interval, stoppingToken);
+            // Wait for the polling interval OR until signaled by an enqueue/retry,
+            // whichever comes first. This preserves the existing polling fallback
+            // while allowing immediate wake-up when new work arrives.
+            try
+            {
+                await _signal.WaitAsync(_interval, stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                // Host is shutting down — exit cleanly
+            }
         }
     }
 }
