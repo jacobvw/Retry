@@ -380,6 +380,87 @@ public class RetryServiceTests : IDisposable
     }
 
     // ──────────────────────────────────────────
+    // HANDLER STATUS OVERRIDE TESTS
+    // ──────────────────────────────────────────
+
+    [Fact]
+    public async Task ProcessPending_HandlerSetsDiscarded_RespectsStatus()
+    {
+        // GIVEN a handler that marks the operation as Discarded
+        _testHandler.StatusOverride = RetryStatus.Discarded;
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null,
+            maxRetries: 3);
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler was called
+        Assert.Equal(1, _testHandler.HandleCallCount);
+
+        // AND the operation is Discarded, NOT Completed
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Discarded, op.Status);
+        Assert.Null(op.CompletedAt); // not marked as completed
+    }
+
+    [Fact]
+    public async Task ProcessPending_HandlerDoesNotOverride_DefaultsToCompleted()
+    {
+        // GIVEN a handler that does NOT set any status override (default behavior)
+        // StatusOverride is null by default
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null);
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN operation is Completed as before
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+        Assert.NotNull(op.CompletedAt);
+    }
+
+    [Fact]
+    public async Task ProcessPending_HandlerSetsFailed_RespectsStatusAndDoesNotRetry()
+    {
+        // GIVEN a handler that marks the operation as Failed (permanently)
+        _testHandler.StatusOverride = RetryStatus.Failed;
+
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "entity-1",
+            eventTimestamp: DateTimeOffset.UtcNow,
+            serializedPayload: null,
+            maxRetries: 3);
+
+        // WHEN we process
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler was called once
+        Assert.Equal(1, _testHandler.HandleCallCount);
+
+        // AND the operation is Failed, not Completed
+        var db = await GetDbContext();
+        var op = await db.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Failed, op.Status);
+
+        // AND processing again does NOT retry it
+        await _retryService.ProcessPendingAsync();
+        Assert.Equal(1, _testHandler.HandleCallCount); // still 1
+    }
+
+    // ──────────────────────────────────────────
     // EXPIRY TESTS
     // ──────────────────────────────────────────
 

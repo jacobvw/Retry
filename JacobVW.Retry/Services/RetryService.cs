@@ -198,10 +198,16 @@ public class RetryService : IRetryService
 
                 await handler.HandleAsync(operation, cancellationToken);
 
-                operation.Status = RetryStatus.Completed;
-                operation.CompletedAt = DateTimeOffset.UtcNow;
+                // Only mark Completed if the handler didn't set a terminal status itself.
+                // This allows handlers to set e.g. Discarded for permanently unprocessable items.
+                if (operation.Status == RetryStatus.InProgress)
+                {
+                    operation.Status = RetryStatus.Completed;
+                    operation.CompletedAt = DateTimeOffset.UtcNow;
+                    operation.LastError = null;
+                }
+
                 operation.UpdatedAt = DateTimeOffset.UtcNow;
-                operation.LastError = null;
                 await store.UpdateAsync(operation, cancellationToken);
 
                 _logger.LogInformation(
