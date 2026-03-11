@@ -1,4 +1,5 @@
 using JacobVW.Retry.Models;
+using JacobVW.Retry.Services;
 
 namespace JacobVW.Retry.Interfaces;
 
@@ -29,6 +30,23 @@ public interface IRetryService
         string? serializedPayload,
         int maxRetries = 3,
         TimeSpan? maxFailedDuration = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Add one or more operations to the provided DbContext's ChangeTracker
+    /// without calling SaveChanges. The caller is responsible for calling
+    /// SaveChanges — the operations will be committed in the same transaction.
+    ///
+    /// Deduplication (HasNewerEventAsync) is checked at enqueue time.
+    /// Stale events are added as Discarded (same as EnqueueAsync).
+    ///
+    /// Call <see cref="RetrySignal.Notify"/> after your SaveChanges completes
+    /// to wake the processor immediately, or let it pick up on the next poll.
+    /// </summary>
+    /// <returns>Number of operations actually enqueued (excludes discarded stale events)</returns>
+    Task<int> EnqueueTransactionalAsync(
+        IRetryDbContext dbContext,
+        IEnumerable<RetryEnqueueRequest> requests,
         CancellationToken cancellationToken = default);
 
     /// <summary>

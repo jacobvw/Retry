@@ -2198,6 +2198,175 @@ public class RetryServiceTests : IDisposable
         await signal.WaitAsync(TimeSpan.Zero, CancellationToken.None)
             .WaitAsync(TimeSpan.FromSeconds(1));
     }
+
+    // ──────────────────────────────────────────
+    // TRANSACTIONAL ENQUEUE TESTS
+    // ──────────────────────────────────────────
+
+    [Fact]
+    public async Task EnqueueTransactional_AddsToChangeTracker_WithoutSaving()
+    {
+        // GIVEN a DbContext
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        var requests = new[]
+        {
+            new RetryEnqueueRequest
+            {
+                OperationName = "TestOperation",
+                EntityKey = "txn-1",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                SerializedPayload = "{\"value\":1}"
+            }
+        };
+
+        // WHEN we enqueue transactionally
+        var count = await _retryService.EnqueueTransactionalAsync(db, requests);
+
+        // THEN it returns 1 enqueued
+        Assert.Equal(1, count);
+
+        // AND the operation is in the ChangeTracker (Added state)
+        var trackedEntries = db.ChangeTracker.Entries<RetryableOperation>().ToList();
+        Assert.Single(trackedEntries);
+        Assert.Equal(EntityState.Added, trackedEntries[0].State);
+
+        // BUT it is NOT persisted yet (no SaveChanges was called)
+        await using var verifyScope = _serviceProvider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<TestDbContext>();
+        var persisted = await verifyDb.RetryableOperations.CountAsync();
+        Assert.Equal(0, persisted);
+
+        // After caller saves, it IS persisted
+        await db.SaveChangesAsync();
+        await using var verifyScope2 = _serviceProvider.CreateAsyncScope();
+        var verifyDb2 = verifyScope2.ServiceProvider.GetRequiredService<TestDbContext>();
+        Assert.Equal(1, await verifyDb2.RetryableOperations.CountAsync());
+    }
+
+    [Fact]
+    public async Task EnqueueTransactional_Batch_AllAdded()
+    {
+        // GIVEN a DbContext and 5 operations
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        var requests = Enumerable.Range(1, 5).Select(i => new RetryEnqueueRequest
+        {
+            OperationName = "TestOperation",
+            EntityKey = $"batch-{i}",
+            EventTimestamp = DateTimeOffset.UtcNow,
+            SerializedPayload = $"{{\"index\":{i}}}"
+        });
+
+        // WHEN we enqueue all 5
+        var count = await _retryService.EnqueueTransactionalAsync(db, requests);
+
+        // THEN all 5 are enqueued
+        Assert.Equal(5, count);
+
+        // AND all 5 are in the ChangeTracker
+        var tracked = db.ChangeTracker.Entries<RetryableOperation>().ToList();
+        Assert.Equal(5, tracked.Count);
+        Assert.All(tracked, e => Assert.Equal(EntityState.Added, e.State));
+    }
+
+    [Fact]
+    public async Task EnqueueTransactional_StaleEvent_AddedAsDiscarded()
+    {
+        // GIVEN a newer event already committed
+        var newerTimestamp = DateTimeOffset.UtcNow;
+        await _retryService.EnqueueAsync(
+            operationName: "TestOperation",
+            entityKey: "txn-stale",
+            eventTimestamp: newerTimestamp,
+            serializedPayload: null);
+
+        // WHEN we enqueue a stale event transactionally
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        var requests = new[]
+        {
+            new RetryEnqueueRequest
+            {
+                OperationName = "TestOperation",
+                EntityKey = "txn-stale",
+                EventTimestamp = newerTimestamp.AddMinutes(-10)
+            }
+        };
+
+        var count = await _retryService.EnqueueTransactionalAsync(db, requests);
+
+        // THEN return count is 0 (stale event was discarded)
+        Assert.Equal(0, count);
+
+        // AND the Discarded operation is in the ChangeTracker
+        var tracked = db.ChangeTracker.Entries<RetryableOperation>().ToList();
+        Assert.Single(tracked);
+        Assert.Equal(RetryStatus.Discarded, tracked[0].Entity.Status);
+        Assert.Contains("Discarded", tracked[0].Entity.LastError);
+    }
+
+    [Fact]
+    public async Task EnqueueTransactional_EmptyBatch_ReturnsZero()
+    {
+        // GIVEN a DbContext and an empty batch
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        // WHEN we enqueue an empty batch
+        var count = await _retryService.EnqueueTransactionalAsync(
+            db, Enumerable.Empty<RetryEnqueueRequest>());
+
+        // THEN returns 0 and nothing in ChangeTracker
+        Assert.Equal(0, count);
+        Assert.Empty(db.ChangeTracker.Entries<RetryableOperation>());
+    }
+
+    [Fact]
+    public async Task EnqueueTransactional_AfterSaveChanges_PickedUpByProcessor()
+    {
+        // GIVEN a transactionally enqueued operation
+        await using var scope = _serviceProvider.CreateAsyncScope();
+        var db = scope.ServiceProvider.GetRequiredService<TestDbContext>();
+
+        var requests = new[]
+        {
+            new RetryEnqueueRequest
+            {
+                OperationName = "TestOperation",
+                EntityKey = "txn-roundtrip",
+                EventTimestamp = DateTimeOffset.UtcNow,
+                SerializedPayload = "{\"roundtrip\":true}",
+                MaxRetries = 3,
+                MaxFailedDuration = TimeSpan.FromHours(1)
+            }
+        };
+
+        var count = await _retryService.EnqueueTransactionalAsync(db, requests);
+        Assert.Equal(1, count);
+
+        // WHEN the caller saves and notifies
+        await db.SaveChangesAsync();
+        _retrySignal.Notify();
+
+        // AND the processor runs
+        await _retryService.ProcessPendingAsync();
+
+        // THEN the handler was called
+        Assert.Equal(1, _testHandler.HandleCallCount);
+        Assert.Single(_testHandler.HandledOperations);
+        Assert.Equal("txn-roundtrip", _testHandler.HandledOperations[0].EntityKey);
+
+        // AND the operation is completed
+        await using var verifyScope = _serviceProvider.CreateAsyncScope();
+        var verifyDb = verifyScope.ServiceProvider.GetRequiredService<TestDbContext>();
+        var op = await verifyDb.RetryableOperations.SingleAsync();
+        Assert.Equal(RetryStatus.Completed, op.Status);
+        Assert.NotNull(op.CompletedAt);
+    }
 }
 
 /// <summary>Helper: a handler type intentionally NOT registered in DI to simulate construction failure.</summary>

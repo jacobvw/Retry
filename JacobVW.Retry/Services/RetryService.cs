@@ -1,5 +1,6 @@
 using JacobVW.Retry.Interfaces;
 using JacobVW.Retry.Models;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
@@ -89,6 +90,97 @@ public class RetryService : IRetryService
 
         _signal.Notify();
         return true;
+    }
+
+    public async Task<int> EnqueueTransactionalAsync(
+        IRetryDbContext dbContext,
+        IEnumerable<RetryEnqueueRequest> requests,
+        CancellationToken cancellationToken = default)
+    {
+        var requestList = requests.ToList();
+        if (requestList.Count == 0) return 0;
+
+        var enqueued = 0;
+        var now = DateTimeOffset.UtcNow;
+
+        // Collect distinct values for DB-translatable Contains() filters
+        var operationNames = requestList.Select(r => r.OperationName).Distinct().ToList();
+        var entityKeys = requestList.Select(r => r.EntityKey).Distinct().ToList();
+
+        // Single query: fetch all active operations matching any of the
+        // requested (OperationName, EntityKey) combinations, then group
+        // client-side to find max EventTimestamp per pair.
+        var candidates = await dbContext.RetryableOperations
+            .Where(x => (x.Status == RetryStatus.Pending
+                         || x.Status == RetryStatus.InProgress
+                         || x.Status == RetryStatus.Completed)
+                        && operationNames.Contains(x.OperationName)
+                        && entityKeys.Contains(x.EntityKey))
+            .Select(x => new { x.OperationName, x.EntityKey, x.EventTimestamp })
+            .ToListAsync(cancellationToken);
+
+        // Build a lookup for O(1) dedup checks in the loop
+        var maxTimestampLookup = candidates
+            .GroupBy(x => (x.OperationName, x.EntityKey))
+            .ToDictionary(
+                g => g.Key,
+                g => g.Max(x => x.EventTimestamp));
+
+        foreach (var request in requestList)
+        {
+            // Dedup: check if a strictly newer event already exists
+            var isStale = maxTimestampLookup.TryGetValue(
+                              (request.OperationName, request.EntityKey),
+                              out var maxTs)
+                          && maxTs > request.EventTimestamp;
+
+            if (isStale)
+            {
+                // Add as Discarded for auditing (same as EnqueueAsync)
+                var discardedOp = new RetryableOperation
+                {
+                    OperationName = request.OperationName,
+                    EntityKey = request.EntityKey,
+                    EventTimestamp = request.EventTimestamp,
+                    SerializedPayload = request.SerializedPayload,
+                    MaxRetries = request.MaxRetries,
+                    Status = RetryStatus.Discarded,
+                    LastError = $"Discarded: a newer event already exists for {request.OperationName}/{request.EntityKey}"
+                };
+                dbContext.RetryableOperations.Add(discardedOp);
+
+                _logger.LogDebug(
+                    "Transactional enqueue discarded stale {OperationName} for {EntityKey}: event={EventTimestamp}",
+                    request.OperationName, request.EntityKey, request.EventTimestamp);
+            }
+            else
+            {
+                var expiresAt = now + (request.MaxFailedDuration ?? DefaultMaxFailedDuration);
+
+                var operation = new RetryableOperation
+                {
+                    OperationName = request.OperationName,
+                    EntityKey = request.EntityKey,
+                    EventTimestamp = request.EventTimestamp,
+                    SerializedPayload = request.SerializedPayload,
+                    MaxRetries = request.MaxRetries,
+                    Status = RetryStatus.Pending,
+                    NextRetryAt = now,
+                    ExpiresAt = expiresAt
+                };
+                dbContext.RetryableOperations.Add(operation);
+
+                _logger.LogInformation(
+                    "Transactional enqueue {OperationName} for {EntityKey} (timestamp={EventTimestamp}, expires={ExpiresAt})",
+                    request.OperationName, request.EntityKey, request.EventTimestamp, expiresAt);
+
+                enqueued++;
+            }
+        }
+
+        // Do NOT call SaveChangesAsync — caller owns the transaction
+        // Do NOT call _signal.Notify() — caller should call it after SaveChanges
+        return enqueued;
     }
 
     public async Task ProcessPendingAsync(CancellationToken cancellationToken = default)
